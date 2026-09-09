@@ -127,11 +127,19 @@ class OnlineGameState {
 
   /// Serializes to Firebase Realtime Database map
   Map<String, dynamic> toMap() {
+    final boardMap = <String, String>{};
+    for (int i = 0; i < board.length; i++) {
+      final cell = board[i];
+      if (cell != null) {
+        boardMap['$i'] = cell;
+      }
+    }
+
     return {
       'gameId': gameId,
       'playerX': playerX,
       'playerO': playerO,
-      'board': board,
+      'board': boardMap,
       'currentTurn': currentTurn,
       'status': status.name,
       'winner': winner,

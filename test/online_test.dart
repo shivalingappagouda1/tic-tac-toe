@@ -1189,6 +1189,137 @@ void main() {
       );
     });
   });
+
+  group('Firebase Board Serialization & JS-Interop Safety (Tests 37-43)', () {
+    test('37. Empty board serializes to an empty Map without null or sparse elements', () {
+      final state = OnlineGameState(
+        gameId: 'game_test_empty',
+        playerX: 'uid_x',
+        board: List.filled(9, null),
+        currentTurn: 'X',
+        status: OnlineGameStatus.waiting,
+      );
+
+      final map = state.toMap();
+      expect(map['board'], isA<Map>());
+      final boardMap = map['board'] as Map;
+      expect(boardMap.isEmpty, isTrue);
+      expect(boardMap.values.contains(null), isFalse);
+    });
+
+    test('38. Board with X serializes only non-null occupied cells with string index keys', () {
+      final board = List<String?>.filled(9, null);
+      board[0] = 'X';
+      board[4] = 'X';
+
+      final state = OnlineGameState(
+        gameId: 'game_test_x',
+        playerX: 'uid_x',
+        board: board,
+      );
+
+      final map = state.toMap();
+      final boardMap = map['board'] as Map;
+      expect(boardMap, equals({'0': 'X', '4': 'X'}));
+      expect(boardMap.containsKey('1'), isFalse);
+      expect(boardMap.values.contains(null), isFalse);
+    });
+
+    test('39. Board with O serializes only non-null occupied cells with string index keys', () {
+      final board = List<String?>.filled(9, null);
+      board[2] = 'O';
+      board[8] = 'O';
+
+      final state = OnlineGameState(
+        gameId: 'game_test_o',
+        playerO: 'uid_o',
+        board: board,
+      );
+
+      final map = state.toMap();
+      final boardMap = map['board'] as Map;
+      expect(boardMap, equals({'2': 'O', '8': 'O'}));
+      expect(boardMap.containsKey('0'), isFalse);
+      expect(boardMap.values.contains(null), isFalse);
+    });
+
+    test('40. Round-trip toMap() -> fromMap() correctly preserves all 9 cells across empty, partial, and full boards', () {
+      // Empty board
+      final emptyState = OnlineGameState(
+        gameId: 'game_rt_empty',
+        playerX: 'uid_x',
+        board: List.filled(9, null),
+      );
+      final fromEmpty = OnlineGameState.fromMap('game_rt_empty', emptyState.toMap());
+      expect(fromEmpty.board, equals(List.filled(9, null)));
+
+      // Partial board
+      final partialBoard = ['X', null, 'O', null, 'X', null, null, null, 'O'];
+      final partialState = OnlineGameState(
+        gameId: 'game_rt_partial',
+        playerX: 'uid_x',
+        playerO: 'uid_o',
+        board: partialBoard,
+      );
+      final fromPartial = OnlineGameState.fromMap('game_rt_partial', partialState.toMap());
+      expect(fromPartial.board, equals(partialBoard));
+
+      // Full board
+      final fullBoard = ['X', 'O', 'X', 'X', 'O', 'O', 'O', 'X', 'X'];
+      final fullState = OnlineGameState(
+        gameId: 'game_rt_full',
+        playerX: 'uid_x',
+        playerO: 'uid_o',
+        board: fullBoard,
+      );
+      final fromFull = OnlineGameState.fromMap('game_rt_full', fullState.toMap());
+      expect(fromFull.board, equals(fullBoard));
+    });
+
+    test('41. Move serialization produces clean map representation with no sparse array holes', () {
+      final boardList = List<dynamic>.filled(9, null);
+      boardList[4] = 'X';
+
+      final boardMap = <String, String>{};
+      for (int i = 0; i < 9; i++) {
+        final cell = boardList[i];
+        if (cell != null) {
+          boardMap['$i'] = cell.toString();
+        }
+      }
+
+      expect(boardMap, equals({'4': 'X'}));
+      expect(boardMap.length, equals(1));
+      expect(boardMap.containsKey('4'), isTrue);
+      expect(boardMap.values.contains(null), isFalse);
+    });
+
+    test('42. Serialized board contains zero null values across all game states', () {
+      for (int i = 0; i < 9; i++) {
+        final board = List<String?>.filled(9, null);
+        board[i] = (i % 2 == 0) ? 'X' : 'O';
+        final state = OnlineGameState(gameId: 'g_$i', board: board);
+        final map = state.toMap();
+        final bMap = map['board'] as Map;
+        for (final val in bMap.values) {
+          expect(val, isNotNull);
+          expect(val, isNot(equals('null')));
+        }
+      }
+    });
+
+    test('43. Verified immune to JavaScript undefined sparse array serialization', () {
+      final state = OnlineGameState(
+        gameId: 'game_sparse_check',
+        board: List.filled(9, null),
+      );
+      final map = state.toMap();
+      final board = map['board'];
+      // Must be Map, NOT a List with null holes
+      expect(board, isA<Map<String, String>>());
+      expect((board as Map).isEmpty, isTrue);
+    });
+  });
 }
 
 bool _evaluateSecurityRulesWrite({

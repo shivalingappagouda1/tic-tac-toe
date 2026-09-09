@@ -89,6 +89,12 @@ class FirebaseOnlineBackend implements OnlineBackend {
     }
   }
 
+  String _sanitizeErrorMessage(dynamic e) {
+    var msg = e.toString().split('\n').first;
+    msg = msg.replaceAll(RegExp(r'(key|token|auth|apiKey)=[a-zA-Z0-9_\-]+'), r'$1=***');
+    return msg;
+  }
+
   @override
   Future<OnlineGameState?> findMatch() async {
     final uid = await signInAnonymously();
@@ -128,7 +134,7 @@ class FirebaseOnlineBackend implements OnlineBackend {
         } catch (e) {
           if (!matchCompleter.isCompleted) {
             matchCompleter.completeError(
-              OnlineException('Failed loading matched game: $e'),
+              OnlineException('Failed loading matched game: ${_sanitizeErrorMessage(e)}'),
             );
           }
         }
@@ -138,26 +144,39 @@ class FirebaseOnlineBackend implements OnlineBackend {
     String? matchedWaitingUid;
 
     // Run atomic transaction on the waiting slot
-    final transactionResult = await queueRef.runTransaction((currentValue) {
-      matchedWaitingUid = null;
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (currentValue != null && currentValue is Map) {
-        final waitingUid = currentValue['uid']?.toString();
-        final joinedAt = int.tryParse(currentValue['joinedAt']?.toString() ?? '0') ?? 0;
-        final isStale = (now - joinedAt) > 40000; // 40s stale timeout
-
-        if (waitingUid != null && waitingUid != uid && !isStale) {
-          // Pair with the waiting player! Clear the slot.
-          matchedWaitingUid = waitingUid;
-          return Transaction.success(null);
-        }
+    final transactionResult = await queueRef.runTransaction((mutableData) {
+      if (mutableData == null) {
+        // No one waiting, place self in queue
+        return Transaction.success({
+          'uid': uid,
+          'joinedAt': ServerValue.timestamp,
+        });
       }
 
-      // No valid opponent waiting: put self in waiting slot
-      return Transaction.success({
-        'uid': uid,
-        'joinedAt': ServerValue.timestamp,
-      });
+      final data = Map<dynamic, dynamic>.from(mutableData as Map);
+      final waitingUid = data['uid']?.toString();
+      final joinedAt = int.tryParse(data['joinedAt']?.toString() ?? '0') ?? 0;
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      if (waitingUid == null || waitingUid == uid) {
+        // Refresh self in queue
+        return Transaction.success({
+          'uid': uid,
+          'joinedAt': ServerValue.timestamp,
+        });
+      }
+
+      // Check for stale queue entry (older than 60s)
+      if (joinedAt > 0 && now - joinedAt > 60000) {
+        return Transaction.success({
+          'uid': uid,
+          'joinedAt': ServerValue.timestamp,
+        });
+      }
+
+      // Pair with the waiting player! Clear the slot.
+      matchedWaitingUid = waitingUid;
+      return Transaction.success(null);
     });
 
     if (!transactionResult.committed) {
@@ -206,15 +225,21 @@ class FirebaseOnlineBackend implements OnlineBackend {
         updatedAt: DateTime.now().millisecondsSinceEpoch,
       );
 
-      await gameRef.set(newGame.toMap());
+      try {
+        await gameRef.set(newGame.toMap());
 
-      // Notify the waiting player with the game ID
-      await _database.ref('matchmaking_queue/matches/$matchedWaitingUid').set({
-        'gameId': gameId,
-        'matchedAt': ServerValue.timestamp,
-      });
+        // Notify the waiting player with the game ID
+        await _database.ref('matchmaking_queue/matches/$matchedWaitingUid').set({
+          'gameId': gameId,
+          'matchedAt': ServerValue.timestamp,
+        });
 
-      return newGame;
+        return newGame;
+      } on OnlineException {
+        rethrow;
+      } catch (e) {
+        throw OnlineException('Failed to start matched game: ${_sanitizeErrorMessage(e)}');
+      }
     } else {
       throw const OnlineException('Matchmaking error: failed to resolve pairing.');
     }
@@ -259,26 +284,32 @@ class FirebaseOnlineBackend implements OnlineBackend {
       expiresAt: expiresAt,
     );
 
-    final roomRef = _database.ref('rooms/$code');
-    await roomRef.set(room.toMap());
-    await roomRef.onDisconnect().update({'status': 'abandoned'});
+    try {
+      final roomRef = _database.ref('rooms/$code');
+      await roomRef.set(room.toMap());
+      await roomRef.onDisconnect().update({'status': 'abandoned'});
 
-    // Initialize waiting game
-    final game = OnlineGameState(
-      gameId: gameId,
-      playerX: uid,
-      playerO: null,
-      board: List.filled(9, null),
-      currentTurn: 'X',
-      status: OnlineGameStatus.waiting,
-      createdAt: now,
-      updatedAt: now,
-    );
-    await _database.ref('games/$gameId').set(game.toMap());
+      // Initialize waiting game
+      final game = OnlineGameState(
+        gameId: gameId,
+        playerX: uid,
+        playerO: null,
+        board: List.filled(9, null),
+        currentTurn: 'X',
+        status: OnlineGameStatus.waiting,
+        createdAt: now,
+        updatedAt: now,
+      );
+      await _database.ref('games/$gameId').set(game.toMap());
 
-    _activeRoomCode = code;
-    _activeGameId = gameId;
-    return room;
+      _activeRoomCode = code;
+      _activeGameId = gameId;
+      return room;
+    } on OnlineException {
+      rethrow;
+    } catch (e) {
+      throw OnlineException('Failed to create room: ${_sanitizeErrorMessage(e)}');
+    }
   }
 
   @override
@@ -287,68 +318,74 @@ class FirebaseOnlineBackend implements OnlineBackend {
     final code = RoomCodeGenerator.normalize(roomCode);
     final roomRef = _database.ref('rooms/$code');
 
-    final result = await roomRef.runTransaction((mutableData) {
-      if (mutableData == null) {
-        return Transaction.abort();
-      }
+    try {
+      final result = await roomRef.runTransaction((mutableData) {
+        if (mutableData == null) {
+          return Transaction.abort();
+        }
 
-      final data = Map<dynamic, dynamic>.from(mutableData as Map);
-      final hostUid = data['hostUid']?.toString();
-      final guestUid = data['guestUid']?.toString();
-      final expiresAt = int.tryParse(data['expiresAt']?.toString() ?? '0') ?? 0;
-      final now = DateTime.now().millisecondsSinceEpoch;
+        final data = Map<dynamic, dynamic>.from(mutableData as Map);
+        final hostUid = data['hostUid']?.toString();
+        final guestUid = data['guestUid']?.toString();
+        final expiresAt = int.tryParse(data['expiresAt']?.toString() ?? '0') ?? 0;
+        final now = DateTime.now().millisecondsSinceEpoch;
 
-      if (expiresAt > 0 && now > expiresAt) {
-        data['status'] = 'expired';
+        if (expiresAt > 0 && now > expiresAt) {
+          data['status'] = 'expired';
+          return Transaction.success(data);
+        }
+
+        if (guestUid != null && guestUid != uid && guestUid.isNotEmpty) {
+          // Room full
+          return Transaction.abort();
+        }
+
+        if (hostUid == uid) {
+          // Re-joining own room
+          return Transaction.success(data);
+        }
+
+        data['guestUid'] = uid;
+        data['status'] = 'active';
         return Transaction.success(data);
+      });
+
+      if (!result.committed || result.snapshot.value == null) {
+        // Check why it failed
+        final snapshot = await roomRef.get();
+        if (snapshot.value == null) {
+          throw const OnlineException('Room not found.');
+        }
+        final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
+        if (data['guestUid'] != null && data['guestUid'] != uid) {
+          throw const OnlineException('Room is full.');
+        }
+        throw const OnlineException('Unable to join room.');
       }
 
-      if (guestUid != null && guestUid != uid && guestUid.isNotEmpty) {
-        // Room full
-        return Transaction.abort();
+      final data = Map<dynamic, dynamic>.from(result.snapshot.value as Map);
+      if (data['status'] == 'expired') {
+        throw const OnlineException('Room expired.');
       }
 
-      if (hostUid == uid) {
-        // Re-joining own room
-        return Transaction.success(data);
-      }
+      final updatedRoom = RoomState.fromMap(code, data);
+      _activeRoomCode = code;
+      _activeGameId = updatedRoom.gameId;
 
-      data['guestUid'] = uid;
-      data['status'] = 'active';
-      return Transaction.success(data);
-    });
+      // Transition game to active
+      final gameRef = _database.ref('games/${updatedRoom.gameId}');
+      await gameRef.update({
+        'playerO': uid,
+        'status': 'active',
+        'updatedAt': ServerValue.timestamp,
+      });
 
-    if (!result.committed || result.snapshot.value == null) {
-      // Check why it failed
-      final snapshot = await roomRef.get();
-      if (snapshot.value == null) {
-        throw const OnlineException('Room not found.');
-      }
-      final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
-      if (data['guestUid'] != null && data['guestUid'] != uid) {
-        throw const OnlineException('Room is full.');
-      }
-      throw const OnlineException('Unable to join room.');
+      return updatedRoom;
+    } on OnlineException {
+      rethrow;
+    } catch (e) {
+      throw OnlineException('Failed to join room: ${_sanitizeErrorMessage(e)}');
     }
-
-    final data = Map<dynamic, dynamic>.from(result.snapshot.value as Map);
-    if (data['status'] == 'expired') {
-      throw const OnlineException('Room expired.');
-    }
-
-    final updatedRoom = RoomState.fromMap(code, data);
-    _activeRoomCode = code;
-    _activeGameId = updatedRoom.gameId;
-
-    // Transition game to active
-    final gameRef = _database.ref('games/${updatedRoom.gameId}');
-    await gameRef.update({
-      'playerO': uid,
-      'status': 'active',
-      'updatedAt': ServerValue.timestamp,
-    });
-
-    return updatedRoom;
   }
 
   @override
@@ -383,130 +420,157 @@ class FirebaseOnlineBackend implements OnlineBackend {
       throw const OnlineException('Invalid cell index.');
     }
 
-    final gameRef = _database.ref('games/$gameId');
+    try {
+      final gameRef = _database.ref('games/$gameId');
 
-    final transactionResult = await gameRef.runTransaction((mutableData) {
-      if (mutableData == null) {
-        return Transaction.abort();
-      }
-
-      final data = Map<dynamic, dynamic>.from(mutableData as Map);
-      final status = data['status']?.toString();
-      if (status != 'active') {
-        return Transaction.abort();
-      }
-
-      final playerX = data['playerX']?.toString();
-      final playerO = data['playerO']?.toString();
-      final currentTurn = data['currentTurn']?.toString() ?? 'X';
-
-      String? role;
-      if (uid == playerX) role = 'X';
-      if (uid == playerO) role = 'O';
-
-      if (role == null || role != currentTurn) {
-        return Transaction.abort();
-      }
-
-      // Check cell vacancy
-      final rawBoard = data['board'];
-      List<dynamic> boardList;
-      if (rawBoard is List) {
-        boardList = List<dynamic>.from(rawBoard);
-      } else if (rawBoard is Map) {
-        boardList = List.filled(9, null);
-        for (int i = 0; i < 9; i++) {
-          boardList[i] = rawBoard['$i'] ?? rawBoard[i];
+      final transactionResult = await gameRef.runTransaction((mutableData) {
+        if (mutableData == null) {
+          return Transaction.abort();
         }
-      } else {
-        boardList = List.filled(9, null);
+
+        final data = Map<dynamic, dynamic>.from(mutableData as Map);
+        final status = data['status']?.toString();
+        if (status != 'active') {
+          return Transaction.abort();
+        }
+
+        final playerX = data['playerX']?.toString();
+        final playerO = data['playerO']?.toString();
+        final currentTurn = data['currentTurn']?.toString() ?? 'X';
+
+        String? role;
+        if (uid == playerX) role = 'X';
+        if (uid == playerO) role = 'O';
+
+        if (role == null || role != currentTurn) {
+          return Transaction.abort();
+        }
+
+        // Check cell vacancy
+        final rawBoard = data['board'];
+        List<dynamic> boardList;
+        if (rawBoard is List) {
+          boardList = List<dynamic>.from(rawBoard);
+        } else if (rawBoard is Map) {
+          boardList = List.filled(9, null);
+          for (int i = 0; i < 9; i++) {
+            boardList[i] = rawBoard['$i'] ?? rawBoard[i];
+          }
+        } else {
+          boardList = List.filled(9, null);
+        }
+
+        if (boardList[cellIndex] != null) {
+          return Transaction.abort();
+        }
+
+        boardList[cellIndex] = role;
+
+        // Serialize board as map containing only non-null occupied cells
+        final boardMap = <String, String>{};
+        for (int i = 0; i < 9; i++) {
+          final cell = boardList[i];
+          if (cell != null) {
+            boardMap['$i'] = cell.toString();
+          }
+        }
+        data['board'] = boardMap;
+
+        // Evaluate win / draw
+        final winningCombo = _evaluateWinner(boardList.cast<String?>());
+        if (winningCombo != null) {
+          data['winner'] = role;
+          data['winningCells'] = winningCombo;
+          data['status'] = 'finished';
+        } else if (!boardList.contains(null)) {
+          data['winner'] = 'Draw';
+          data['winningCells'] = null;
+          data['status'] = 'finished';
+        } else {
+          data['currentTurn'] = (role == 'X') ? 'O' : 'X';
+        }
+
+        final moveCount = int.tryParse(data['moveCount']?.toString() ?? '0') ?? 0;
+        data['moveCount'] = moveCount + 1;
+        data['lastMoveIndex'] = cellIndex;
+        data['lastMovePlayer'] = role;
+        data['updatedAt'] = ServerValue.timestamp;
+
+        return Transaction.success(data);
+      });
+
+      if (!transactionResult.committed) {
+        throw const OnlineException('Move rejected by authoritative game server.');
       }
-
-      if (boardList[cellIndex] != null) {
-        return Transaction.abort();
-      }
-
-      boardList[cellIndex] = role;
-      data['board'] = boardList;
-
-      // Evaluate win / draw
-      final winningCombo = _evaluateWinner(boardList.cast<String?>());
-      if (winningCombo != null) {
-        data['winner'] = role;
-        data['winningCells'] = winningCombo;
-        data['status'] = 'finished';
-      } else if (!boardList.contains(null)) {
-        data['winner'] = 'Draw';
-        data['winningCells'] = null;
-        data['status'] = 'finished';
-      } else {
-        data['currentTurn'] = (role == 'X') ? 'O' : 'X';
-      }
-
-      final moveCount = int.tryParse(data['moveCount']?.toString() ?? '0') ?? 0;
-      data['moveCount'] = moveCount + 1;
-      data['lastMoveIndex'] = cellIndex;
-      data['lastMovePlayer'] = role;
-      data['updatedAt'] = ServerValue.timestamp;
-
-      return Transaction.success(data);
-    });
-
-    if (!transactionResult.committed) {
-      throw const OnlineException('Move rejected by authoritative game server.');
+      return true;
+    } on OnlineException {
+      rethrow;
+    } catch (e) {
+      throw OnlineException('Failed to execute move: ${_sanitizeErrorMessage(e)}');
     }
-    return true;
   }
 
   @override
   Future<void> requestRematch(String gameId) async {
     final uid = currentUserId;
     if (uid == null) return;
-    final gameRef = _database.ref('games/$gameId');
+    try {
+      final gameRef = _database.ref('games/$gameId');
 
-    await gameRef.runTransaction((mutableData) {
-      if (mutableData == null) return Transaction.abort();
-      final data = Map<dynamic, dynamic>.from(mutableData as Map);
-      final playerX = data['playerX']?.toString();
-      final playerO = data['playerO']?.toString();
+      await gameRef.runTransaction((mutableData) {
+        if (mutableData == null) return Transaction.abort();
+        final data = Map<dynamic, dynamic>.from(mutableData as Map);
+        final playerX = data['playerX']?.toString();
+        final playerO = data['playerO']?.toString();
 
-      Map<dynamic, dynamic> rematch = {};
-      if (data['rematch'] is Map) {
-        rematch = Map<dynamic, dynamic>.from(data['rematch'] as Map);
-      }
+        Map<dynamic, dynamic> rematch = {};
+        if (data['rematch'] is Map) {
+          rematch = Map<dynamic, dynamic>.from(data['rematch'] as Map);
+        }
 
-      if (uid == playerX) rematch['requestX'] = true;
-      if (uid == playerO) rematch['requestO'] = true;
+        if (uid == playerX) rematch['requestX'] = true;
+        if (uid == playerO) rematch['requestO'] = true;
 
-      if (rematch['requestX'] == true && rematch['requestO'] == true) {
-        // Both agreed -> reset board
-        data['board'] = List.filled(9, null);
-        data['currentTurn'] = 'X';
-        data['status'] = 'active';
-        data['winner'] = null;
-        data['winningCells'] = null;
-        data['moveCount'] = 0;
-        data['rematch'] = {'requestX': false, 'requestO': false};
-      } else {
-        data['rematch'] = rematch;
-      }
-      data['updatedAt'] = ServerValue.timestamp;
-      return Transaction.success(data);
-    });
+        if (rematch['requestX'] == true && rematch['requestO'] == true) {
+          // Both agreed -> reset board to empty non-sparse map
+          data['board'] = <String, String>{};
+          data['currentTurn'] = 'X';
+          data['status'] = 'active';
+          data['winner'] = null;
+          data['winningCells'] = null;
+          data['moveCount'] = 0;
+          data['rematch'] = {'requestX': false, 'requestO': false};
+        } else {
+          data['rematch'] = rematch;
+        }
+        data['updatedAt'] = ServerValue.timestamp;
+        return Transaction.success(data);
+      });
+    } on OnlineException {
+      rethrow;
+    } catch (e) {
+      throw OnlineException('Failed to request rematch: ${_sanitizeErrorMessage(e)}');
+    }
   }
 
   @override
   Future<void> resetRound(String gameId) async {
-    await _database.ref('games/$gameId').update({
-      'board': List.filled(9, null),
-      'currentTurn': 'X',
-      'status': 'active',
-      'winner': null,
-      'winningCells': null,
-      'moveCount': 0,
-      'rematch': {'requestX': false, 'requestO': false},
-      'updatedAt': ServerValue.timestamp,
-    });
+    try {
+      await _database.ref('games/$gameId').update({
+        'board': <String, String>{},
+        'currentTurn': 'X',
+        'status': 'active',
+        'winner': null,
+        'winningCells': null,
+        'moveCount': 0,
+        'rematch': {'requestX': false, 'requestO': false},
+        'updatedAt': ServerValue.timestamp,
+      });
+    } on OnlineException {
+      rethrow;
+    } catch (e) {
+      throw OnlineException('Failed to reset round: ${_sanitizeErrorMessage(e)}');
+    }
   }
 
   @override
