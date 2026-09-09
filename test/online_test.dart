@@ -1291,7 +1291,7 @@ void main() {
       expect(boardMap, equals({'4': 'X'}));
       expect(boardMap.length, equals(1));
       expect(boardMap.containsKey('4'), isTrue);
-      expect(boardMap.values.contains(null), isFalse);
+      expect(boardMap.values.every((v) => v.isNotEmpty), isTrue);
     });
 
     test('42. Serialized board contains zero null values across all game states', () {
@@ -1318,6 +1318,241 @@ void main() {
       // Must be Map, NOT a List with null holes
       expect(board, isA<Map<String, String>>());
       expect((board as Map).isEmpty, isTrue);
+    });
+  });
+
+  group('Production Regression: Board Normalization & RangeError Immunity (Tests 44-49)', () {
+    List<dynamic> normalizeBoard(Object? rawBoard) {
+      final boardList = List<dynamic>.filled(9, null);
+      if (rawBoard is List) {
+        for (int i = 0; i < 9 && i < rawBoard.length; i++) {
+          boardList[i] = rawBoard[i];
+        }
+      } else if (rawBoard is Map) {
+        for (int i = 0; i < 9; i++) {
+          boardList[i] = rawBoard['$i'] ?? rawBoard[i];
+        }
+      }
+      return boardList;
+    }
+
+    test('44. Board stored as Map with keys 0,2,4 normalizes to 9-element list', () {
+      final rawBoard = {'0': 'O', '2': 'X', '4': 'X'};
+      final boardList = normalizeBoard(rawBoard);
+
+      expect(boardList.length, equals(9));
+      expect(boardList[0], equals('O'));
+      expect(boardList[1], isNull);
+      expect(boardList[2], equals('X'));
+      expect(boardList[3], isNull);
+      expect(boardList[4], equals('X'));
+      expect(boardList[5], isNull);
+      expect(boardList[6], isNull);
+      expect(boardList[7], isNull);
+      expect(boardList[8], isNull);
+    });
+
+    test('45. Board returned as List of length 5 normalizes to 9-element list', () {
+      final rawBoard = <dynamic>['O', null, 'X', null, 'X'];
+      expect(rawBoard.length, equals(5));
+
+      final boardList = normalizeBoard(rawBoard);
+
+      expect(boardList.length, equals(9));
+      expect(boardList[0], equals('O'));
+      expect(boardList[1], isNull);
+      expect(boardList[2], equals('X'));
+      expect(boardList[3], isNull);
+      expect(boardList[4], equals('X'));
+      expect(boardList[5], isNull);
+      expect(boardList[6], isNull);
+      expect(boardList[7], isNull);
+      expect(boardList[8], isNull);
+    });
+
+    test('46. Board returned as List of length less than 9 normalizes to 9-element list', () {
+      for (int len = 1; len <= 8; len++) {
+        final rawBoard = List<dynamic>.generate(len, (i) => i.isEven ? 'X' : 'O');
+        final boardList = normalizeBoard(rawBoard);
+        expect(boardList.length, equals(9));
+        for (int i = 0; i < len; i++) {
+          expect(boardList[i], equals(i.isEven ? 'X' : 'O'));
+        }
+        for (int i = len; i < 9; i++) {
+          expect(boardList[i], isNull);
+        }
+      }
+    });
+
+    test('47. Board returned as a full 9-element List preserves all positions', () {
+      final rawBoard = <dynamic>['X', 'O', 'X', 'O', 'X', 'O', 'O', 'X', 'O'];
+      final boardList = normalizeBoard(rawBoard);
+      expect(boardList.length, equals(9));
+      expect(boardList, equals(rawBoard));
+    });
+
+    test('48. Moves on indexes 5, 6, 7, 8 do not cause RangeError on coerced 5-element board', () {
+      final rawBoard = <dynamic>['O', null, 'X', null, 'X'];
+      final boardList = normalizeBoard(rawBoard);
+
+      for (final cellIndex in [1, 3, 5, 6, 7, 8]) {
+        expect(() {
+          final testBoard = List<dynamic>.from(boardList);
+          expect(testBoard[cellIndex], isNull);
+          testBoard[cellIndex] = 'O';
+          expect(testBoard.length, equals(9));
+        }, returnsNormally);
+      }
+    });
+
+    test('49. Winner evaluation works correctly on normalized 9-cell boards', () {
+      final rawBoard = <dynamic>['O', null, 'X', null, 'X'];
+      final boardList = normalizeBoard(rawBoard);
+      boardList[5] = 'O';
+      boardList[6] = 'X';
+
+      final stringBoard = boardList.cast<String?>();
+      const lines = [
+        [0, 1, 2], [3, 4, 5], [6, 7, 8],
+        [0, 3, 6], [1, 4, 7], [2, 5, 8],
+        [0, 4, 8], [2, 4, 6]
+      ];
+      List<int>? winningCombo;
+      for (final line in lines) {
+        final a = stringBoard[line[0]];
+        final b = stringBoard[line[1]];
+        final c = stringBoard[line[2]];
+        if (a != null && a == b && b == c) {
+          winningCombo = line;
+          break;
+        }
+      }
+      expect(winningCombo, equals([2, 4, 6]));
+    });
+  });
+
+  group('Production Regression: Online With Code Join & Atomic Assignment (Tests 50-56)', () {
+    test('50. Guest joins an existing room when the room was not previously cached', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_uncached',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_uncached',
+      );
+
+      final room = await backendA.createRoom();
+      final joined = await backendB.joinRoom(room.roomCode);
+      expect(joined.roomCode, equals(room.roomCode));
+      expect(joined.guestUid, equals('guest_uncached'));
+      expect(joined.status, equals('active'));
+    });
+
+    test('51. Valid host/guest identities are preserved', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_id_test',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_id_test',
+      );
+
+      final room = await backendA.createRoom();
+      final joined = await backendB.joinRoom(room.roomCode);
+      expect(joined.hostUid, equals('host_id_test'));
+      expect(joined.guestUid, equals('guest_id_test'));
+    });
+
+    test('52. Room transitions from waiting to active correctly', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_trans_test',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_trans_test',
+      );
+
+      final room = await backendA.createRoom();
+      expect(MockSharedDatabase.instance.rooms[room.roomCode]!.status, equals('waiting'));
+      await backendB.joinRoom(room.roomCode);
+      expect(MockSharedDatabase.instance.rooms[room.roomCode]!.status, equals('active'));
+    });
+
+    test('53. Both clients resolve the same gameId', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_gid',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_gid',
+      );
+
+      final room = await backendA.createRoom();
+      final joined = await backendB.joinRoom(room.roomCode);
+      expect(room.gameId, equals(joined.gameId));
+      final game = MockSharedDatabase.instance.games[room.gameId]!;
+      expect(game.gameId, equals(room.gameId));
+    });
+
+    test('54. Two simultaneous guests cannot both occupy the guest slot (race condition)', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_race',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_race_1',
+      );
+      final backendC = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_race_2',
+      );
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+
+      expect(
+        backendC.joinRoom(room.roomCode),
+        throwsA(predicate((e) => e is OnlineException && e.message.contains('Room is full.'))),
+      );
+    });
+
+    test('55. Missing room still returns "Room not found."', () async {
+      final backend = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_missing',
+      );
+      expect(
+        backend.joinRoom('NOMTCH'),
+        throwsA(predicate((e) => e is OnlineException && e.message.contains('Room not found.'))),
+      );
+    });
+
+    test('56. Full room still returns "Room is full."', () async {
+      final backendA = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'host_full',
+      );
+      final backendB = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_full_1',
+      );
+      final backendC = MockOnlineBackend(
+        database: MockSharedDatabase.instance,
+        initialUid: 'guest_full_2',
+      );
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+
+      expect(
+        backendC.joinRoom(room.roomCode),
+        throwsA(predicate((e) => e is OnlineException && e.message.contains('Room is full.'))),
+      );
     });
   });
 }

@@ -319,12 +319,33 @@ class FirebaseOnlineBackend implements OnlineBackend {
     final roomRef = _database.ref('rooms/$code');
 
     try {
+      // 1. Pre-fetch the room to warm local cache and verify existence
+      final initialSnapshot = await roomRef.get();
+      if (!initialSnapshot.exists || initialSnapshot.value == null) {
+        throw const OnlineException('Room not found.');
+      }
+      final initialData = Map<dynamic, dynamic>.from(initialSnapshot.value as Map);
+      final initialGuest = initialData['guestUid']?.toString();
+      final initialExpires = int.tryParse(initialData['expiresAt']?.toString() ?? '0') ?? 0;
+      final preCheckNow = DateTime.now().millisecondsSinceEpoch;
+
+      if (initialExpires > 0 && preCheckNow > initialExpires) {
+        throw const OnlineException('Room expired.');
+      }
+      if (initialGuest != null && initialGuest != uid && initialGuest.isNotEmpty) {
+        throw const OnlineException('Room is full.');
+      }
+
+      // 2. Run atomic transaction to safely assign the guest slot
       final result = await roomRef.runTransaction((mutableData) {
-        if (mutableData == null) {
+        // Do not abort if mutableData is null on the first uncached callback;
+        // seed with the pre-fetched initialData so Firebase proceeds to server validation.
+        final raw = mutableData ?? initialData;
+        if (raw is! Map) {
           return Transaction.abort();
         }
 
-        final data = Map<dynamic, dynamic>.from(mutableData as Map);
+        final data = Map<dynamic, dynamic>.from(raw);
         final hostUid = data['hostUid']?.toString();
         final guestUid = data['guestUid']?.toString();
         final expiresAt = int.tryParse(data['expiresAt']?.toString() ?? '0') ?? 0;
@@ -336,7 +357,7 @@ class FirebaseOnlineBackend implements OnlineBackend {
         }
 
         if (guestUid != null && guestUid != uid && guestUid.isNotEmpty) {
-          // Room full
+          // Room full - another guest joined simultaneously
           return Transaction.abort();
         }
 
@@ -351,14 +372,18 @@ class FirebaseOnlineBackend implements OnlineBackend {
       });
 
       if (!result.committed || result.snapshot.value == null) {
-        // Check why it failed
+        // Check why it failed atomically
         final snapshot = await roomRef.get();
-        if (snapshot.value == null) {
+        if (!snapshot.exists || snapshot.value == null) {
           throw const OnlineException('Room not found.');
         }
         final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
         if (data['guestUid'] != null && data['guestUid'] != uid) {
           throw const OnlineException('Room is full.');
+        }
+        final expiresAt = int.tryParse(data['expiresAt']?.toString() ?? '0') ?? 0;
+        if (expiresAt > 0 && DateTime.now().millisecondsSinceEpoch > expiresAt) {
+          throw const OnlineException('Room expired.');
         }
         throw const OnlineException('Unable to join room.');
       }
@@ -446,18 +471,17 @@ class FirebaseOnlineBackend implements OnlineBackend {
           return Transaction.abort();
         }
 
-        // Check cell vacancy
+        // Normalize board to exactly 9 positions before any indexing or winner evaluation
         final rawBoard = data['board'];
-        List<dynamic> boardList;
+        final boardList = List<dynamic>.filled(9, null);
         if (rawBoard is List) {
-          boardList = List<dynamic>.from(rawBoard);
+          for (int i = 0; i < 9 && i < rawBoard.length; i++) {
+            boardList[i] = rawBoard[i];
+          }
         } else if (rawBoard is Map) {
-          boardList = List.filled(9, null);
           for (int i = 0; i < 9; i++) {
             boardList[i] = rawBoard['$i'] ?? rawBoard[i];
           }
-        } else {
-          boardList = List.filled(9, null);
         }
 
         if (boardList[cellIndex] != null) {
