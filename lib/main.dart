@@ -1,16 +1,40 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' show lerpDouble;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
 
 import 'sound/audio_service.dart';
 import 'ai/tic_tac_toe_ai.dart';
+import 'online/models/online_game_state.dart';
+import 'online/services/online_backend.dart';
+import 'online/services/firebase_online_backend.dart';
+import 'online/services/room_code_generator.dart';
+import 'online/services/session_storage_service.dart';
+import 'online/firebase_options.dart';
 
-void main() {
-  runApp(const TicTacToeApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  OnlineBackend? onlineBackend;
+  try {
+    if (DefaultFirebaseOptions.isConfigured) {
+      final options = DefaultFirebaseOptions.currentPlatform;
+      if (options != null) {
+        await Firebase.initializeApp(options: options);
+        onlineBackend = FirebaseOnlineBackend();
+      }
+    }
+  } catch (e) {
+    debugPrint('[ONLINE] Firebase initialization skipped or failed: $e');
+  }
+  runApp(TicTacToeApp(onlineBackend: onlineBackend));
 }
 
 class TicTacToeApp extends StatelessWidget {
-  const TicTacToeApp({super.key});
+  final OnlineBackend? onlineBackend;
+
+  const TicTacToeApp({super.key, this.onlineBackend});
 
   @override
   Widget build(BuildContext context) {
@@ -21,13 +45,15 @@ class TicTacToeApp extends StatelessWidget {
         useMaterial3: true,
         brightness: Brightness.dark,
       ),
-      home: const TicTacToeGamePage(),
+      home: TicTacToeGamePage(onlineBackend: onlineBackend),
     );
   }
 }
 
 class TicTacToeGamePage extends StatefulWidget {
-  const TicTacToeGamePage({super.key});
+  final OnlineBackend? onlineBackend;
+
+  const TicTacToeGamePage({super.key, this.onlineBackend});
 
   @override
   State<TicTacToeGamePage> createState() => _TicTacToeGamePageState();
@@ -41,7 +67,7 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   // 'X' is Player 1, 'O' is Player 2. 'X' always starts a new round.
   String _currentPlayer = 'X';
 
-  // Active game mode: Two Players or Vs Computer
+  // Active game mode: exactly 4 modes (COMPUTER, 1 VS 1, COMPLETE ONLINE, ONLINE WITH CODE)
   GameMode _gameMode = GameMode.twoPlayer;
 
   // Active AI difficulty level when in Vs Computer mode
@@ -85,6 +111,28 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   late final AnimationController _winController;
   late final Animation<double> _winAnimation;
 
+  // Online Multiplayer State
+  OnlineBackend? _onlineBackend;
+  OnlineGameState? _onlineGameState;
+  String? _onlineRole; // 'X' or 'O'
+  String? _onlineRoomCode;
+  bool _isMatchmaking = false;
+  bool _isCreatingRoom = false;
+  bool _isJoiningRoom = false;
+  bool _isSubmittingMove = false;
+  String? _onlineErrorMessage;
+  bool _isReconnecting = false;
+  bool _isOpponentDisconnected = false;
+  bool _isPrivateRoomHost = false;
+  int _privateRoomTab = 0; // 0 = Create Room, 1 = Join Room
+
+  final TextEditingController _roomCodeInputController =
+      TextEditingController();
+
+  StreamSubscription<OnlineGameState>? _gameStreamSub;
+  StreamSubscription<bool>? _opponentPresenceSub;
+  StreamSubscription<bool>? _connectionSub;
+
   // All 8 possible winning combinations (rows, columns, diagonals)
   static const List<List<int>> _winningCombinations = [
     // Rows
@@ -103,7 +151,8 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   @override
   void initState() {
     super.initState();
-
+    _onlineBackend = widget.onlineBackend;
+    _initConnectionListener();
     _soundService = AudioService();
 
     _placementController = AnimationController(
@@ -123,18 +172,112 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
       parent: _winController,
       curve: Curves.easeOutCubic,
     );
+
+    _restoreActiveSession();
+  }
+
+  Future<void> _restoreActiveSession() async {
+    try {
+      final session = await SessionStorageService.instance.loadSession();
+      if (session == null || !mounted) return;
+
+      final targetMode = session.mode == 'onlineWithCode'
+          ? GameMode.onlineWithCode
+          : GameMode.completeOnline;
+
+      final backend = await _ensureBackend();
+      if (backend == null || !mounted) return;
+
+      setState(() {
+        _gameMode = targetMode;
+        _isReconnecting = true;
+        _onlineRoomCode = session.roomCode;
+        _onlineRole = session.role;
+        _isPrivateRoomHost = session.isHost;
+      });
+
+      final gameSnapshot = await backend.getGame(session.gameId);
+
+      if (!mounted) return;
+
+      if (gameSnapshot == null ||
+          gameSnapshot.status == OnlineGameStatus.abandoned) {
+        await SessionStorageService.instance.clearSession();
+        setState(() {
+          _isReconnecting = false;
+          _onlineErrorMessage = 'Previous match was ended or abandoned.';
+        });
+        return;
+      }
+
+      _attachToGame(gameSnapshot);
+      setState(() => _isReconnecting = false);
+    } catch (e) {
+      debugPrint('[ONLINE] Session restoration skipped/failed: $e');
+      if (mounted) {
+        setState(() => _isReconnecting = false);
+      }
+    }
   }
 
   @override
   void dispose() {
+    _cleanupOnlineSubscriptions();
+    _roomCodeInputController.dispose();
     _soundService.dispose();
     _placementController.dispose();
     _winController.dispose();
     super.dispose();
   }
 
+  void _initConnectionListener() {
+    _connectionSub?.cancel();
+    _connectionSub = _onlineBackend?.connectionStream.listen((connected) {
+      if (mounted) {
+        setState(() => _isReconnecting = !connected);
+      }
+    });
+  }
+
+  void _cleanupOnlineSubscriptions() {
+    _gameStreamSub?.cancel();
+    _gameStreamSub = null;
+    _opponentPresenceSub?.cancel();
+    _opponentPresenceSub = null;
+    _connectionSub?.cancel();
+    _connectionSub = null;
+  }
+
+  Future<OnlineBackend?> _ensureBackend() async {
+    if (_onlineBackend != null) return _onlineBackend;
+
+    try {
+      if (DefaultFirebaseOptions.isConfigured) {
+        final options = DefaultFirebaseOptions.currentPlatform;
+        if (options != null) {
+          await Firebase.initializeApp(options: options);
+          _onlineBackend = FirebaseOnlineBackend();
+          return _onlineBackend;
+        }
+      }
+    } catch (e) {
+      debugPrint('[ONLINE] Lazy Firebase init failed: $e');
+    }
+
+    setState(() {
+      _onlineErrorMessage = 'Online multiplayer requires Firebase configuration.';
+    });
+    return null;
+  }
+
   /// Handles player tapping a cell on the board
   void _handleTap(int index) {
+    if (_gameMode == GameMode.completeOnline ||
+        _gameMode == GameMode.onlineWithCode) {
+      _handleOnlineTap(index);
+      return;
+    }
+
     if (_board[index] != null || _winner != null || _isComputerThinking) {
       return;
     }
@@ -180,6 +323,372 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
         _winner == null &&
         _currentPlayer == 'O') {
       _triggerComputerMove();
+    }
+  }
+
+  /// Handles move in online multiplayer modes
+  Future<void> _handleOnlineTap(int index) async {
+    if (_board[index] != null ||
+        _winner != null ||
+        _isSubmittingMove ||
+        _onlineGameState == null ||
+        _onlineGameState!.status != OnlineGameStatus.active ||
+        _onlineRole == null ||
+        _currentPlayer != _onlineRole) {
+      return;
+    }
+
+    final backend = _onlineBackend;
+    if (backend == null) return;
+
+    setState(() {
+      _isSubmittingMove = true;
+      _onlineErrorMessage = null;
+    });
+
+    try {
+      await backend.makeMove(_onlineGameState!.gameId, index);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isSubmittingMove = false;
+          _onlineErrorMessage =
+              e is OnlineException ? e.message : 'Move rejected by server.';
+        });
+      }
+    }
+  }
+
+  /// Incoming stream updates from authoritative backend
+  void _onOnlineGameUpdated(OnlineGameState newState) {
+    if (!mounted) return;
+
+    final prevBoard = _board;
+    final newBoard = newState.board;
+    int? remoteMoveIndex;
+
+    // Detect if a new remote move was placed
+    if (newState.lastMoveIndex != null &&
+        newState.lastMovePlayer != null &&
+        newState.lastMovePlayer != _onlineRole) {
+      remoteMoveIndex = newState.lastMoveIndex;
+    } else {
+      for (int i = 0; i < 9; i++) {
+        if (prevBoard[i] == null && newBoard[i] != null && newBoard[i] != _onlineRole) {
+          remoteMoveIndex = i;
+          break;
+        }
+      }
+    }
+
+    setState(() {
+      _isSubmittingMove = false;
+      _onlineGameState = newState;
+      _board = List.from(newBoard);
+      _currentPlayer = newState.currentTurn;
+
+      // Physical piece drop animation and move sound for remote move
+      if (remoteMoveIndex != null && prevBoard[remoteMoveIndex] == null) {
+        _lastPlacedIndex = remoteMoveIndex;
+        _placementController.forward(from: 0.0);
+        _soundService.playMove();
+      }
+
+      // Check authoritative game conclusion
+      if (newState.winner != null && _winner == null) {
+        _winner = newState.winner;
+        _winningLine = newState.winningCells;
+        if (_winningLine != null) {
+          _winController.forward(from: 0.0);
+        }
+
+        if (_winner == 'Draw') {
+          _scoreDraw++;
+          _soundService.playDraw();
+        } else if (_winner == _onlineRole) {
+          if (_onlineRole == 'X') {
+            _scoreX++;
+            _soundService.playXWin();
+          } else {
+            _scoreO++;
+            _soundService.playOWin();
+          }
+        } else {
+          // Opponent won
+          if (_onlineRole == 'X') {
+            _scoreO++;
+            _soundService.playOWin();
+          } else {
+            _scoreX++;
+            _soundService.playXWin();
+          }
+        }
+      } else if (newState.winner == null && _winner != null) {
+        // Rematch agreement -> clean board for next round
+        _winner = null;
+        _winningLine = null;
+        _lastPlacedIndex = null;
+        _placementController.reset();
+        _winController.reset();
+        _soundService.playNewRound();
+      }
+    });
+
+    if (newState.status == OnlineGameStatus.abandoned) {
+      SessionStorageService.instance.clearSession();
+    }
+  }
+
+  void _attachToGame(OnlineGameState game) {
+    _cleanupOnlineSubscriptions();
+    final uid = _onlineBackend?.currentUserId;
+    final role = game.roleOf(uid) ?? 'X';
+
+    SessionStorageService.instance.saveSession(ActiveSessionData(
+      gameId: game.gameId,
+      roomCode: _onlineRoomCode,
+      role: role,
+      mode: _gameMode == GameMode.onlineWithCode
+          ? 'onlineWithCode'
+          : 'completeOnline',
+      isHost: _isPrivateRoomHost,
+    ));
+
+    setState(() {
+      _isMatchmaking = false;
+      _onlineGameState = game;
+      _onlineRole = role;
+      _board = List.from(game.board);
+      _currentPlayer = game.currentTurn;
+      _winner = game.winner;
+      _winningLine = game.winningCells;
+      _onlineErrorMessage = null;
+    });
+
+    _gameStreamSub =
+        _onlineBackend!.streamGame(game.gameId).listen(_onOnlineGameUpdated);
+
+    final opponentUid = (role == 'X') ? game.playerO : game.playerX;
+    if (opponentUid != null && opponentUid.isNotEmpty) {
+      _opponentPresenceSub = _onlineBackend!
+          .streamOpponentPresence(opponentUid)
+          .listen((online) {
+        if (mounted) {
+          setState(() => _isOpponentDisconnected = !online);
+        }
+      });
+    }
+
+    _connectionSub = _onlineBackend!.connectionStream.listen((connected) {
+      if (mounted) {
+        setState(() => _isReconnecting = !connected);
+      }
+    });
+  }
+
+  /// Start complete online random matchmaking
+  Future<void> _startMatchmaking() async {
+    final backend = await _ensureBackend();
+    if (backend == null) return;
+
+    _cleanupOnlineSubscriptions();
+
+    setState(() {
+      _isMatchmaking = true;
+      _onlineErrorMessage = null;
+      _onlineGameState = null;
+      _onlineRole = null;
+      _board = List.filled(9, null);
+      _winner = null;
+      _winningLine = null;
+      _lastPlacedIndex = null;
+      _placementController.reset();
+      _winController.reset();
+    });
+
+    try {
+      final matchedGame = await backend.findMatch();
+      if (matchedGame != null && mounted) {
+        _attachToGame(matchedGame);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isMatchmaking = false;
+          _onlineErrorMessage =
+              e is OnlineException ? e.message : 'Matchmaking failed.';
+        });
+      }
+    }
+  }
+
+  Future<void> _cancelMatchmaking() async {
+    try {
+      await _onlineBackend?.cancelMatchmaking();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _isMatchmaking = false;
+      });
+    }
+  }
+
+  /// Create private room
+  Future<void> _createPrivateRoom() async {
+    final backend = await _ensureBackend();
+    if (backend == null) return;
+
+    _cleanupOnlineSubscriptions();
+
+    setState(() {
+      _isCreatingRoom = true;
+      _onlineErrorMessage = null;
+      _onlineGameState = null;
+      _onlineRole = 'X';
+      _board = List.filled(9, null);
+      _winner = null;
+      _winningLine = null;
+      _lastPlacedIndex = null;
+      _placementController.reset();
+      _winController.reset();
+    });
+
+    try {
+      final room = await backend.createRoom();
+      if (!mounted) return;
+
+      SessionStorageService.instance.saveSession(ActiveSessionData(
+        gameId: room.gameId,
+        roomCode: room.roomCode,
+        role: 'X',
+        mode: 'onlineWithCode',
+        isHost: true,
+      ));
+
+      setState(() {
+        _isCreatingRoom = false;
+        _onlineRoomCode = room.roomCode;
+        _isPrivateRoomHost = true;
+      });
+
+      _gameStreamSub =
+          backend.streamGame(room.gameId).listen((gameState) {
+        if (!mounted) return;
+        _onOnlineGameUpdated(gameState);
+        if (gameState.status == OnlineGameStatus.active &&
+            _onlineGameState?.status != OnlineGameStatus.active) {
+          final opponentUid = gameState.playerO;
+          if (opponentUid != null) {
+            _opponentPresenceSub?.cancel();
+            _opponentPresenceSub = backend
+                .streamOpponentPresence(opponentUid)
+                .listen((online) {
+              if (mounted) setState(() => _isOpponentDisconnected = !online);
+            });
+          }
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isCreatingRoom = false;
+          _onlineErrorMessage =
+              e is OnlineException ? e.message : 'Failed to create room.';
+        });
+      }
+    }
+  }
+
+  /// Join private room by code
+  Future<void> _joinPrivateRoom() async {
+    final code = _roomCodeInputController.text.trim();
+    if (!RoomCodeGenerator.isValid(code)) {
+      setState(() =>
+          _onlineErrorMessage = 'Please enter a valid 6-character room code.');
+      return;
+    }
+
+    final backend = await _ensureBackend();
+    if (backend == null) return;
+
+    _cleanupOnlineSubscriptions();
+
+    setState(() {
+      _isJoiningRoom = true;
+      _onlineErrorMessage = null;
+      _onlineGameState = null;
+      _onlineRole = 'O';
+      _board = List.filled(9, null);
+      _winner = null;
+      _winningLine = null;
+      _lastPlacedIndex = null;
+      _placementController.reset();
+      _winController.reset();
+    });
+
+    try {
+      final room = await backend.joinRoom(code);
+      if (!mounted) return;
+
+      SessionStorageService.instance.saveSession(ActiveSessionData(
+        gameId: room.gameId,
+        roomCode: room.roomCode,
+        role: 'O',
+        mode: 'onlineWithCode',
+        isHost: false,
+      ));
+
+      setState(() {
+        _isJoiningRoom = false;
+        _onlineRoomCode = room.roomCode;
+        _isPrivateRoomHost = false;
+      });
+
+      _gameStreamSub =
+          backend.streamGame(room.gameId).listen(_onOnlineGameUpdated);
+
+      _opponentPresenceSub?.cancel();
+      _opponentPresenceSub =
+          backend.streamOpponentPresence(room.hostUid).listen((online) {
+        if (mounted) setState(() => _isOpponentDisconnected = !online);
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isJoiningRoom = false;
+          _onlineErrorMessage =
+              e is OnlineException ? e.message : 'Unable to join room.';
+        });
+      }
+    }
+  }
+
+  Future<void> _leaveOnlineGame() async {
+    SessionStorageService.instance.clearSession();
+    _cleanupOnlineSubscriptions();
+    if (_onlineGameState?.gameId != null) {
+      await _onlineBackend?.leaveGame(_onlineGameState!.gameId);
+    } else if (_onlineRoomCode != null) {
+      await _onlineBackend?.leaveRoom(_onlineRoomCode!);
+    }
+
+    if (mounted) {
+      setState(() {
+        _onlineGameState = null;
+        _onlineRole = null;
+        _onlineRoomCode = null;
+        _isMatchmaking = false;
+        _isCreatingRoom = false;
+        _isJoiningRoom = false;
+        _onlineErrorMessage = null;
+        _isReconnecting = false;
+        _isOpponentDisconnected = false;
+        _board = List.filled(9, null);
+        _winner = null;
+        _winningLine = null;
+        _placementController.reset();
+        _winController.reset();
+      });
     }
   }
 
@@ -253,6 +762,14 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   /// Starts a new round while preserving the session score
   void _resetBoard() {
     _soundService.playNewRound();
+    if (_gameMode == GameMode.completeOnline ||
+        _gameMode == GameMode.onlineWithCode) {
+      if (_onlineGameState != null) {
+        _onlineBackend?.requestRematch(_onlineGameState!.gameId);
+      }
+      return;
+    }
+
     setState(() {
       _gameEpoch++;
       _isComputerThinking = false;
@@ -270,6 +787,11 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   /// Resets both the board and the session scores
   void _resetAll() {
     _soundService.playReset();
+    if (_gameMode == GameMode.completeOnline ||
+        _gameMode == GameMode.onlineWithCode) {
+      _leaveOnlineGame();
+    }
+
     setState(() {
       _gameEpoch++;
       _isComputerThinking = false;
@@ -287,10 +809,22 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
     });
   }
 
-  /// Switches active game mode (Two Players / Vs Computer)
+  /// Switches active game mode cleanly between all four modes
   void _setGameMode(GameMode mode) {
     if (_gameMode == mode) return;
     _soundService.playButton();
+
+    // Safely leave / cleanup previous online mode if switching away
+    if (_gameMode == GameMode.completeOnline ||
+        _gameMode == GameMode.onlineWithCode) {
+      SessionStorageService.instance.clearSession();
+      _cleanupOnlineSubscriptions();
+      _onlineBackend?.cancelMatchmaking();
+      if (_onlineGameState?.gameId != null) {
+        _onlineBackend?.leaveGame(_onlineGameState!.gameId);
+      }
+    }
+
     setState(() {
       _gameMode = mode;
       _gameEpoch++;
@@ -301,9 +835,22 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
       _winningLine = null;
       _hoveredIndex = null;
       _lastPlacedIndex = null;
+      _onlineGameState = null;
+      _onlineRole = null;
+      _onlineRoomCode = null;
+      _isMatchmaking = false;
+      _isCreatingRoom = false;
+      _isJoiningRoom = false;
+      _onlineErrorMessage = null;
+      _isReconnecting = false;
+      _isOpponentDisconnected = false;
       _placementController.reset();
       _winController.reset();
     });
+
+    if (mode == GameMode.completeOnline || mode == GameMode.onlineWithCode) {
+      _initConnectionListener();
+    }
   }
 
   /// Changes AI difficulty in Vs Computer mode
@@ -337,7 +884,7 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
       } else {
         return 'Your Turn';
       }
-    } else {
+    } else if (_gameMode == GameMode.twoPlayer) {
       if (_winner == 'X') {
         return 'Player X Wins!';
       } else if (_winner == 'O') {
@@ -346,6 +893,36 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
         return 'Player X to move';
       } else {
         return 'Player O to move';
+      }
+    } else {
+      // Online modes (Complete Online & Online With Code)
+      if (_isReconnecting) {
+        return 'Reconnecting...';
+      }
+      if (_isOpponentDisconnected) {
+        return 'Opponent Disconnected';
+      }
+      if (_onlineGameState == null ||
+          _onlineGameState!.status == OnlineGameStatus.waiting) {
+        if (_gameMode == GameMode.completeOnline) {
+          return _isMatchmaking ? 'Finding Opponent...' : 'Complete Online';
+        } else {
+          return _onlineRoomCode != null
+              ? 'Waiting for Opponent...'
+              : 'Private Room';
+        }
+      }
+      if (_winner != null) {
+        if (_winner == _onlineRole) {
+          return 'You Win!';
+        } else {
+          return 'Opponent Wins!';
+        }
+      }
+      if (_currentPlayer == _onlineRole) {
+        return 'Your Turn';
+      } else {
+        return "Opponent's Turn";
       }
     }
   }
@@ -449,19 +1026,14 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
           );
         }
 
-        // DESKTOP / LAPTOP HEADER:
-        // LEFT: reserved spacing matching right controls width (76px)
-        // CENTER: title mathematically centered relative to the whole board
-        // RIGHT: controls (76px)
+        // DESKTOP / LAPTOP HEADER
         const double controlsWidth = 76.0;
 
         return SizedBox(
           height: 44,
           child: Row(
             children: [
-              // LEFT: reserved empty spacing
               const SizedBox(width: controlsWidth),
-              // CENTER: title independently centered, never overlapping controls
               Expanded(
                 child: Center(
                   child: FittedBox(
@@ -470,7 +1042,6 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
                   ),
                 ),
               ),
-              // RIGHT: dedicated controls area
               SizedBox(
                 width: controlsWidth,
                 child: _buildControlsRow(),
@@ -663,10 +1234,25 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
   Widget _buildCell(int index) {
     final value = _board[index];
     final isWinningCell = _winningLine?.contains(index) ?? false;
-    final isInteractive = value == null &&
-        _winner == null &&
-        !_isComputerThinking &&
-        (_gameMode == GameMode.twoPlayer || _currentPlayer == 'X');
+
+    // Interactive check supports local and online turns
+    final bool isInteractive;
+    if (_gameMode == GameMode.completeOnline ||
+        _gameMode == GameMode.onlineWithCode) {
+      isInteractive = value == null &&
+          _winner == null &&
+          !_isSubmittingMove &&
+          _onlineGameState != null &&
+          _onlineGameState!.status == OnlineGameStatus.active &&
+          _onlineRole != null &&
+          _currentPlayer == _onlineRole;
+    } else {
+      isInteractive = value == null &&
+          _winner == null &&
+          !_isComputerThinking &&
+          (_gameMode == GameMode.twoPlayer || _currentPlayer == 'X');
+    }
+
     final isHovered = _hoveredIndex == index && isInteractive;
     final isDraw = _winner == 'Draw';
     final isDimmed =
@@ -766,7 +1352,7 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
         fontSize: 20,
         fontWeight: FontWeight.w900,
         letterSpacing: 2.2,
-        color: Color(0xFFFFF7ED), // Off-white cream matching reference
+        color: Color(0xFFFFF7ED),
         shadows: [
           Shadow(
             color: Colors.black,
@@ -785,8 +1371,24 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
 
   /// Compact classic brass/wood plaque for session score tracking
   Widget _buildScorePlaque() {
-    final p1Label = _gameMode == GameMode.vsComputer ? 'YOU (X)' : 'P1 (X)';
-    final p2Label = _gameMode == GameMode.vsComputer ? 'COM (O)' : 'P2 (O)';
+    final String p1Label;
+    final String p2Label;
+
+    if (_gameMode == GameMode.vsComputer) {
+      p1Label = 'YOU (X)';
+      p2Label = 'COM (O)';
+    } else if (_gameMode == GameMode.twoPlayer) {
+      p1Label = 'P1 (X)';
+      p2Label = 'P2 (O)';
+    } else {
+      if (_onlineRole == 'X') {
+        p1Label = 'YOU (X)';
+        p2Label = 'OPP (O)';
+      } else {
+        p1Label = 'OPP (X)';
+        p2Label = 'YOU (O)';
+      }
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
@@ -877,11 +1479,12 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
     );
   }
 
-  /// Polished wooden mode and difficulty controls matching the physical tabletop design
+  /// FOUR-MODE SELECTION PANEL
+  /// ALL FOUR MODES ARE PERMANENTLY VISIBLE SIMULTANEOUSLY AT ALL TIMES.
   Widget _buildModeAndDifficultyBar() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
         color: const Color(0xFF180C05),
         borderRadius: BorderRadius.circular(10),
@@ -905,15 +1508,17 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Row 1: GAME MODE
+          // Header
           Row(
-            children: [
-              const Text(
-                'GAME MODE:',
+            children: const [
+              Icon(Icons.sports_esports_rounded, size: 14, color: Color(0xFFC59B63)),
+              SizedBox(width: 5),
+              Text(
+                'GAME MODE',
                 style: TextStyle(
                   fontSize: 10,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1.2,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 1.4,
                   color: Color(0xFFC59B63),
                   shadows: [
                     Shadow(
@@ -924,25 +1529,246 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
                   ],
                 ),
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Row(
+            ],
+          ),
+          const SizedBox(height: 7),
+
+          // 4 Modes: 2x2 grid on large/medium screens, stacked on narrow screens
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isNarrow = constraints.maxWidth < 320;
+              if (isNarrow) {
+                return Column(
                   children: [
-                    Expanded(
-                      child: _buildSelectorButton(
-                        buttonKey: const Key('mode_two_players'),
-                        label: 'TWO PLAYERS',
-                        isSelected: _gameMode == GameMode.twoPlayer,
-                        onTap: () => _setGameMode(GameMode.twoPlayer),
+                    _buildModeCard(
+                      key: const Key('mode_vs_computer'),
+                      mode: GameMode.vsComputer,
+                      title: 'COMPUTER',
+                      subtitle: 'Play against AI',
+                      icon: Icons.smart_toy_rounded,
+                    ),
+                    const SizedBox(height: 5),
+                    _buildModeCard(
+                      key: const Key('mode_two_players'),
+                      mode: GameMode.twoPlayer,
+                      title: '1 VS 1',
+                      subtitle: 'Local multiplayer',
+                      icon: Icons.people_alt_rounded,
+                    ),
+                    const SizedBox(height: 5),
+                    _buildModeCard(
+                      key: const Key('mode_complete_online'),
+                      mode: GameMode.completeOnline,
+                      title: 'COMPLETE ONLINE',
+                      subtitle: 'Random opponent',
+                      icon: Icons.public_rounded,
+                    ),
+                    const SizedBox(height: 5),
+                    _buildModeCard(
+                      key: const Key('mode_online_with_code'),
+                      mode: GameMode.onlineWithCode,
+                      title: 'ONLINE WITH CODE',
+                      subtitle: 'Private room',
+                      icon: Icons.vpn_key_rounded,
+                    ),
+                  ],
+                );
+              }
+
+              // 2x2 arrangement
+              return Column(
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildModeCard(
+                          key: const Key('mode_vs_computer'),
+                          mode: GameMode.vsComputer,
+                          title: 'COMPUTER',
+                          subtitle: 'Play against AI',
+                          icon: Icons.smart_toy_rounded,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _buildModeCard(
+                          key: const Key('mode_two_players'),
+                          mode: GameMode.twoPlayer,
+                          title: '1 VS 1',
+                          subtitle: 'Local multiplayer',
+                          icon: Icons.people_alt_rounded,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildModeCard(
+                          key: const Key('mode_complete_online'),
+                          mode: GameMode.completeOnline,
+                          title: 'COMPLETE ONLINE',
+                          subtitle: 'Random online opponent',
+                          icon: Icons.public_rounded,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _buildModeCard(
+                          key: const Key('mode_online_with_code'),
+                          mode: GameMode.onlineWithCode,
+                          title: 'ONLINE WITH CODE',
+                          subtitle: 'Private room',
+                          icon: Icons.vpn_key_rounded,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              );
+            },
+          ),
+
+          // SECONDARY CONTROLS REGION:
+          // Reveals mode-specific secondary controls while keeping all four primary modes visible!
+          if (_gameMode == GameMode.vsComputer) ...[
+            const SizedBox(height: 8),
+            _buildComputerDifficultyControls(),
+          ] else if (_gameMode == GameMode.twoPlayer) ...[
+            const SizedBox(height: 6),
+            _buildLocalMultiplayerInfo(),
+          ] else if (_gameMode == GameMode.completeOnline) ...[
+            const SizedBox(height: 8),
+            _buildCompleteOnlineControls(),
+          ] else if (_gameMode == GameMode.onlineWithCode) ...[
+            const SizedBox(height: 8),
+            _buildOnlineWithCodeControls(),
+          ],
+
+          // Status & Error Banners
+          if (_onlineErrorMessage != null ||
+              _isReconnecting ||
+              _isOpponentDisconnected) ...[
+            const SizedBox(height: 7),
+            _buildOnlineStatusBar(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Tactile wooden Mode Card with active golden border and rich walnut gradient
+  Widget _buildModeCard({
+    required Key key,
+    required GameMode mode,
+    required String title,
+    required String subtitle,
+    required IconData icon,
+  }) {
+    final isSelected = _gameMode == mode;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: key,
+        onTap: () => _setGameMode(mode),
+        borderRadius: BorderRadius.circular(8),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            gradient: isSelected
+                ? const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0xFF8A5528),
+                      Color(0xFF532E11),
+                    ],
+                  )
+                : const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0xFF26150B),
+                      Color(0xFF140A04),
+                    ],
+                  ),
+            border: Border.all(
+              color: isSelected
+                  ? const Color(0xFFE5B567)
+                  : const Color(0xFF4A311D),
+              width: isSelected ? 1.6 : 1.0,
+            ),
+            boxShadow: isSelected
+                ? const [
+                    BoxShadow(
+                      color: Color(0x66FFA000),
+                      offset: Offset(0, 1),
+                      blurRadius: 4,
+                    ),
+                    BoxShadow(
+                      color: Color(0x33FFE082),
+                      offset: Offset(0, -1),
+                      blurRadius: 1,
+                    ),
+                  ]
+                : const [
+                    BoxShadow(
+                      color: Color(0x44000000),
+                      offset: Offset(0, 1),
+                      blurRadius: 2,
+                    ),
+                  ],
+          ),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                size: 16,
+                color: isSelected
+                    ? const Color(0xFFFFF8E1)
+                    : const Color(0xFFB88A58),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: isSelected ? FontWeight.w900 : FontWeight.w700,
+                          letterSpacing: 0.6,
+                          color: isSelected
+                              ? const Color(0xFFFFFBF0)
+                              : const Color(0xFFD4B89B),
+                          shadows: const [
+                            Shadow(
+                              color: Colors.black,
+                              offset: Offset(1, 1),
+                              blurRadius: 2,
+                            ),
+                          ],
+                        ),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: _buildSelectorButton(
-                        buttonKey: const Key('mode_vs_computer'),
-                        label: 'VS COMPUTER',
-                        isSelected: _gameMode == GameMode.vsComputer,
-                        onTap: () => _setGameMode(GameMode.vsComputer),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 8.5,
+                        fontWeight: FontWeight.w500,
+                        color: isSelected
+                            ? const Color(0xFFFDE68A)
+                            : const Color(0xFF8D735B),
                       ),
                     ),
                   ],
@@ -950,64 +1776,553 @@ class _TicTacToeGamePageState extends State<TicTacToeGamePage>
               ),
             ],
           ),
-          // Row 2: DIFFICULTY (revealed when VS COMPUTER is active)
-          if (_gameMode == GameMode.vsComputer) ...[
-            const SizedBox(height: 6),
-            Row(
+        ),
+      ),
+    );
+  }
+
+  /// Difficulty controls revealed when COMPUTER mode is active
+  Widget _buildComputerDifficultyControls() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF100703),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF422614)),
+      ),
+      child: Row(
+        children: [
+          const Text(
+            'DIFFICULTY:  ',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.0,
+              color: Color(0xFFC59B63),
+              shadows: [
+                Shadow(
+                  color: Colors.black,
+                  offset: Offset(1, 1),
+                  blurRadius: 2,
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Row(
               children: [
-                const Text(
-                  'DIFFICULTY:  ',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.2,
-                    color: Color(0xFFC59B63),
+                Expanded(
+                  child: _buildSelectorButton(
+                    buttonKey: const Key('difficulty_easy'),
+                    label: 'EASY',
+                    isSelected: _difficulty == Difficulty.easy,
+                    onTap: () => _setDifficulty(Difficulty.easy),
+                  ),
+                ),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: _buildSelectorButton(
+                    buttonKey: const Key('difficulty_medium'),
+                    label: 'MEDIUM',
+                    isSelected: _difficulty == Difficulty.medium,
+                    onTap: () => _setDifficulty(Difficulty.medium),
+                  ),
+                ),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: _buildSelectorButton(
+                    buttonKey: const Key('difficulty_hard'),
+                    label: 'HARD',
+                    isSelected: _difficulty == Difficulty.hard,
+                    onTap: () => _setDifficulty(Difficulty.hard),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Local multiplayer information badge for 1 VS 1 mode
+  Widget _buildLocalMultiplayerInfo() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: const Color(0xFF100703),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF3B200F)),
+      ),
+      child: const Text(
+        'LOCAL 2-PLAYER: PASS & PLAY ON THIS DEVICE',
+        style: TextStyle(
+          fontSize: 9.5,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.0,
+          color: Color(0xFFD4B89B),
+        ),
+      ),
+    );
+  }
+
+  /// Matchmaking controls and status for COMPLETE ONLINE mode
+  Widget _buildCompleteOnlineControls() {
+    final inActiveGame = _onlineGameState != null &&
+        _onlineGameState!.status == OnlineGameStatus.active;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF100703),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF422614)),
+      ),
+      child: inActiveGame
+          ? Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2B170D),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFFD4A359)),
+                  ),
+                  child: Text(
+                    'YOU ARE $_onlineRole',
+                    style: const TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w900,
+                      color: Color(0xFFFFF8E1),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Playing vs Random Opponent',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFFD4B89B),
+                    ),
+                  ),
+                ),
+                _buildSmallActionBtn(
+                  key: const Key('btn_leave_online'),
+                  label: 'LEAVE',
+                  icon: Icons.exit_to_app_rounded,
+                  onTap: _leaveOnlineGame,
+                ),
+              ],
+            )
+          : _isMatchmaking
+              ? Row(
+                  children: [
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.0,
+                        color: Color(0xFFFDE68A),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Finding opponent...',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFFFDE68A),
+                        ),
+                      ),
+                    ),
+                    _buildSmallActionBtn(
+                      key: const Key('btn_cancel_matchmaking'),
+                      label: 'CANCEL',
+                      icon: Icons.close_rounded,
+                      onTap: _cancelMatchmaking,
+                    ),
+                  ],
+                )
+              : Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Play with a random opponent worldwide',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Color(0xFFA89A8E),
+                        ),
+                      ),
+                    ),
+                    _buildSmallActionBtn(
+                      key: const Key('btn_find_opponent'),
+                      label: 'FIND OPPONENT',
+                      icon: Icons.search_rounded,
+                      primary: true,
+                      onTap: _startMatchmaking,
+                    ),
+                  ],
+                ),
+    );
+  }
+
+  /// Private room controls for ONLINE WITH CODE mode
+  Widget _buildOnlineWithCodeControls() {
+    final inActiveGame = _onlineGameState != null &&
+        _onlineGameState!.status == OnlineGameStatus.active;
+
+    if (inActiveGame) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF100703),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFF422614)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2B170D),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: const Color(0xFFD4A359)),
+              ),
+              child: Text(
+                'CODE: $_onlineRoomCode • YOU: $_onlineRole',
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                  color: Color(0xFFFFF8E1),
+                ),
+              ),
+            ),
+            const Spacer(),
+            _buildSmallActionBtn(
+              key: const Key('btn_leave_room'),
+              label: 'LEAVE',
+              icon: Icons.exit_to_app_rounded,
+              onTap: _leaveOnlineGame,
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_onlineRoomCode != null && _isPrivateRoomHost) {
+      // Waiting for opponent to enter the room code
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xFF100703),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFFD4A359), width: 1.2),
+        ),
+        child: Column(
+          children: [
+            const Text(
+              'ROOM CODE',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 1.5,
+                color: Color(0xFFC59B63),
+              ),
+            ),
+            const SizedBox(height: 3),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _onlineRoomCode!,
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 4.0,
+                    color: Color(0xFFFFFBF0),
                     shadows: [
                       Shadow(
                         color: Colors.black,
                         offset: Offset(1, 1),
-                        blurRadius: 2,
+                        blurRadius: 3,
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: _buildSelectorButton(
-                          buttonKey: const Key('difficulty_easy'),
-                          label: 'EASY',
-                          isSelected: _difficulty == Difficulty.easy,
-                          onTap: () => _setDifficulty(Difficulty.easy),
-                        ),
+                const SizedBox(width: 8),
+                IconButton(
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  icon: const Icon(Icons.copy_rounded, size: 16, color: Color(0xFFFDE68A)),
+                  tooltip: 'Copy Code',
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: _onlineRoomCode!));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Room code copied!'),
+                        duration: Duration(seconds: 2),
                       ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: _buildSelectorButton(
-                          buttonKey: const Key('difficulty_medium'),
-                          label: 'MEDIUM',
-                          isSelected: _difficulty == Difficulty.medium,
-                          onTap: () => _setDifficulty(Difficulty.medium),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: _buildSelectorButton(
-                          buttonKey: const Key('difficulty_hard'),
-                          label: 'HARD',
-                          isSelected: _difficulty == Difficulty.hard,
-                          onTap: () => _setDifficulty(Difficulty.hard),
-                        ),
-                      ),
-                    ],
+                    );
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            const Text(
+              'Share this code with your opponent.',
+              style: TextStyle(fontSize: 10, color: Color(0xFFD4B89B)),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.8,
+                    color: Color(0xFFFDE68A),
                   ),
+                ),
+                const SizedBox(width: 6),
+                const Text(
+                  'Waiting for opponent...',
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFFFDE68A)),
+                ),
+                const SizedBox(width: 14),
+                _buildSmallActionBtn(
+                  key: const Key('btn_cancel_room'),
+                  label: 'CANCEL',
+                  icon: Icons.close_rounded,
+                  onTap: _leaveOnlineGame,
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Default: Tabs for CREATE ROOM / JOIN ROOM
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF100703),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF422614)),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: _buildSelectorButton(
+                  buttonKey: const Key('btn_create_room_tab'),
+                  label: 'CREATE ROOM',
+                  isSelected: _privateRoomTab == 0,
+                  onTap: () => setState(() => _privateRoomTab = 0),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _buildSelectorButton(
+                  buttonKey: const Key('btn_join_room_tab'),
+                  label: 'JOIN ROOM',
+                  isSelected: _privateRoomTab == 1,
+                  onTap: () => setState(() => _privateRoomTab = 1),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          if (_privateRoomTab == 0) ...[
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Generate code to share with friend',
+                    style: TextStyle(fontSize: 10, color: Color(0xFFA89A8E)),
+                  ),
+                ),
+                _buildSmallActionBtn(
+                  key: const Key('btn_create_room'),
+                  label: _isCreatingRoom ? 'CREATING...' : 'CREATE ROOM',
+                  icon: Icons.add_circle_outline_rounded,
+                  primary: true,
+                  onTap: _isCreatingRoom ? () {} : _createPrivateRoom,
+                ),
+              ],
+            ),
+          ] else ...[
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 32,
+                    child: TextField(
+                      key: const Key('input_room_code'),
+                      controller: _roomCodeInputController,
+                      textCapitalization: TextCapitalization.characters,
+                      maxLength: 6,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 2.0,
+                        color: Color(0xFFFFFBF0),
+                      ),
+                      decoration: InputDecoration(
+                        counterText: '',
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                        hintText: 'ENTER CODE',
+                        hintStyle: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.0,
+                          color: Color(0xFF6B4D35),
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF1D0E06),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          borderSide: const BorderSide(color: Color(0xFF5A361D)),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          borderSide: const BorderSide(color: Color(0xFFD4A359)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _buildSmallActionBtn(
+                  key: const Key('btn_submit_join_room'),
+                  label: _isJoiningRoom ? 'JOINING...' : 'JOIN ROOM',
+                  icon: Icons.login_rounded,
+                  primary: true,
+                  onTap: _isJoiningRoom ? () {} : _joinPrivateRoom,
                 ),
               ],
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  /// Status and Error banner for online operations
+  Widget _buildOnlineStatusBar() {
+    String text = '';
+    IconData icon = Icons.info_outline_rounded;
+    Color textColor = const Color(0xFFFDE68A);
+
+    if (_isReconnecting) {
+      text = 'Connection lost. Reconnecting...';
+      icon = Icons.sync_rounded;
+    } else if (_isOpponentDisconnected) {
+      text = 'Opponent disconnected.';
+      icon = Icons.person_off_rounded;
+      textColor = const Color(0xFFFF8A80);
+    } else if (_onlineErrorMessage != null) {
+      text = _onlineErrorMessage!;
+      icon = Icons.warning_amber_rounded;
+      textColor = const Color(0xFFFF8A80);
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF260C0A),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF8B251F)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: textColor),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: textColor,
+              ),
+            ),
+          ),
+          if (_onlineErrorMessage != null)
+            GestureDetector(
+              onTap: () => setState(() => _onlineErrorMessage = null),
+              child: const Icon(Icons.close_rounded, size: 14, color: Color(0xFFA89A8E)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSmallActionBtn({
+    required Key key,
+    required String label,
+    required IconData icon,
+    required VoidCallback onTap,
+    bool primary = false,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: key,
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(6),
+            gradient: primary
+                ? const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0xFF8A5528), Color(0xFF532E11)],
+                  )
+                : const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0xFF2B170D), Color(0xFF190C05)],
+                  ),
+            border: Border.all(
+              color: primary ? const Color(0xFFD4A359) : const Color(0xFF5A361D),
+              width: 1.0,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 13,
+                color: primary ? const Color(0xFFFFF8E1) : const Color(0xFFD4B89B),
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.5,
+                  color: primary ? const Color(0xFFFFF8E1) : const Color(0xFFD4B89B),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1338,7 +2653,7 @@ class PhysicalBoardFramePainter extends CustomPainter {
     final rect = Offset.zero & size;
     final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(16));
 
-    // 1. Deep Multi-tier Contact & Tabletop Shadows (dynamically responds to light angle)
+    // 1. Deep Multi-tier Contact & Tabletop Shadows
     final shadowOffset = Offset(
       mouseOffset.dx * 6,
       18.0 + mouseOffset.dy * 6,
@@ -1368,15 +2683,15 @@ class PhysicalBoardFramePainter extends CustomPainter {
       contactShadowPaint,
     );
 
-    // 2. Base Chamfered Wooden Frame (molded walnut/oak)
+    // 2. Base Chamfered Wooden Frame
     final framePaint = Paint()
       ..shader = const LinearGradient(
         begin: Alignment.topLeft,
         end: Alignment.bottomRight,
         colors: [
-          Color(0xFF7E4E2C), // Key-light highlight at 11 o'clock
-          Color(0xFF502E19), // Rich walnut midtone
-          Color(0xFF2B170D), // Deep wood shadow at 5 o'clock
+          Color(0xFF7E4E2C),
+          Color(0xFF502E19),
+          Color(0xFF2B170D),
         ],
         stops: [0.0, 0.45, 1.0],
       ).createShader(rect);
@@ -1391,7 +2706,7 @@ class PhysicalBoardFramePainter extends CustomPainter {
       canvas.drawLine(Offset(2, y), Offset(size.width - 2, y), woodGrainPaint);
     }
 
-    // 4. Outer Frame Specular Highlight Bevel (gleams on top and left)
+    // 4. Outer Frame Specular Highlight Bevel
     final outerBevelPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.4
@@ -1399,9 +2714,9 @@ class PhysicalBoardFramePainter extends CustomPainter {
         begin: Alignment.topLeft,
         end: Alignment.bottomRight,
         colors: [
-          Color(0x99FFE082), // Golden key light reflection
+          Color(0x99FFE082),
           Color(0x228B5A33),
-          Color(0x88000000), // Shadowed bottom/right edge
+          Color(0x88000000),
         ],
         stops: [0.0, 0.5, 1.0],
       ).createShader(rect);
@@ -1431,11 +2746,8 @@ class PhysicalBoardFramePainter extends CustomPainter {
     ];
 
     for (final c in corners) {
-      // Small brass mounting coin
       canvas.drawCircle(c, 4.0, bracketPaint);
-      // Contact shadow of rivet
       canvas.drawCircle(c + const Offset(0.5, 1.0), 1.8, rivetShadow);
-      // Raised brass dome rivet
       canvas.drawCircle(c, 1.6, rivetPaint);
     }
   }
@@ -1522,7 +2834,7 @@ class CarvedCellWellPainter extends CustomPainter {
       canvas.drawRRect(rrect, drawGlowPaint);
     }
 
-    // 4. Inset Top Cast Shadow (deep shadow cast by upper divider rail)
+    // 4. Inset Top Cast Shadow
     final topShadow = Paint()
       ..shader = const LinearGradient(
         begin: Alignment.topCenter,
@@ -1532,7 +2844,7 @@ class CarvedCellWellPainter extends CustomPainter {
       ).createShader(Rect.fromLTWH(0, 0, size.width, 9.0));
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, 9.0), topShadow);
 
-    // 5. Inset Left Cast Shadow (shadow cast by left divider rail)
+    // 5. Inset Left Cast Shadow
     final leftShadow = Paint()
       ..shader = const LinearGradient(
         begin: Alignment.centerLeft,
@@ -1554,13 +2866,11 @@ class CarvedCellWellPainter extends CustomPainter {
                   ? const Color(0x338A5B36)
                   : const Color(0x778A5B36)));
 
-    // Bottom lip
     canvas.drawLine(
       Offset(2, size.height - 0.7),
       Offset(size.width - 2, size.height - 0.7),
       lipPaint,
     );
-    // Right lip
     canvas.drawLine(
       Offset(size.width - 0.7, 2),
       Offset(size.width - 0.7, size.height - 2),
@@ -1577,7 +2887,6 @@ class CarvedCellWellPainter extends CustomPainter {
 }
 
 /// Dynamic Winning Line Painter: Draws an illuminated golden connection beam sweeping across winning cells
-/// Calibrated to pass through the exact geometric center of all 3 cells taking divider spacing into account.
 class WinningLinePainter extends CustomPainter {
   final List<int> winningLine;
   final double progress;
@@ -1591,7 +2900,6 @@ class WinningLinePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (winningLine.length < 3) return;
 
-    // GridView uses crossAxisSpacing: 8, mainAxisSpacing: 8
     const double spacing = 8.0;
     final cellW = (size.width - 2 * spacing) / 3;
     final cellH = (size.height - 2 * spacing) / 3;
@@ -1608,7 +2916,6 @@ class WinningLinePainter extends CustomPainter {
     final p1 = getCellCenter(winningLine.first);
     final p2 = getCellCenter(winningLine.last);
 
-    // Vector from p1 to p2
     final dir = p2 - p1;
     final distance = dir.distance;
     final unitDir = distance > 0 ? dir / distance : Offset.zero;
@@ -1692,7 +2999,6 @@ class PieceXWidget extends StatelessWidget {
                   ],
                 ),
               ),
-            // Contact shadow projected onto wooden cell floor
             Transform.translate(
               offset: shadowOffset,
               child: Image.asset(
@@ -1702,7 +3008,6 @@ class PieceXWidget extends StatelessWidget {
                 height: constraints.maxHeight,
               ),
             ),
-            // High-resolution physical 3D piece
             Image.asset(
               'assets/images/pieces/piece_x.png',
               fit: BoxFit.contain,
@@ -1747,7 +3052,6 @@ class PieceOWidget extends StatelessWidget {
                   ],
                 ),
               ),
-            // Contact shadow projected onto wooden cell floor
             Transform.translate(
               offset: shadowOffset,
               child: Image.asset(
@@ -1757,7 +3061,6 @@ class PieceOWidget extends StatelessWidget {
                 height: constraints.maxHeight,
               ),
             ),
-            // High-resolution physical 3D piece
             Image.asset(
               'assets/images/pieces/piece_o.png',
               fit: BoxFit.contain,

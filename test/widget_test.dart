@@ -421,7 +421,6 @@ void main() {
     await tester.pumpAndSettle();
 
     // Next human move
-    int nextHumanCell = 1;
     if (find.byKey(const Key('cell_1')).evaluate().isNotEmpty) {
       // Find an available cell in row 0 or row 1
       for (final c in [1, 2, 3, 4, 5, 6, 7, 8]) {

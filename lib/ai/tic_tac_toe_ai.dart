@@ -4,6 +4,8 @@ import 'dart:math' as math;
 enum GameMode {
   twoPlayer,
   vsComputer,
+  completeOnline,
+  onlineWithCode,
 }
 
 /// Difficulty levels for the computer opponent
