@@ -251,8 +251,7 @@ class MockOnlineBackend implements OnlineBackend {
     }
 
     if (room.hostUid == _uid) {
-      // Re-joining own room as host
-      return room;
+      throw const OnlineException('You cannot join your own room. Share this code with a friend on another device.');
     }
 
     // Guest joins room: host is X, guest is O
@@ -389,6 +388,7 @@ class MockOnlineBackend implements OnlineBackend {
   Future<void> requestRematch(String gameId) async {
     final game = _db.games[gameId];
     if (game == null) return;
+    if (game.status != OnlineGameStatus.finished) return;
     final role = game.roleOf(_uid);
     if (role == null) return;
 
