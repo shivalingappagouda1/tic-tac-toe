@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
@@ -22,6 +23,7 @@ class FirebaseOnlineBackend implements OnlineBackend {
   bool get isConnected => _isConnected;
 
   StreamSubscription<DatabaseEvent>? _matchNotificationSub;
+  Completer<OnlineGameState?>? _matchCompleter;
   String? _activeRoomCode;
   String? _activeGameId;
   String? get activeGameId => _activeGameId;
@@ -66,21 +68,32 @@ class FirebaseOnlineBackend implements OnlineBackend {
       if (user == null) {
         final credential = await _auth.signInAnonymously();
         user = credential.user;
+      } else {
+        try {
+          await user.getIdToken(true);
+        } catch (_) {
+          final credential = await _auth.signInAnonymously();
+          user = credential.user;
+        }
       }
       if (user == null) {
         throw const OnlineException('Unable to establish anonymous session.');
       }
 
-      // Configure Realtime presence for this device
-      final presenceRef = _database.ref('presence/${user.uid}');
-      await presenceRef.onDisconnect().set({
-        'online': false,
-        'lastSeen': ServerValue.timestamp,
-      });
-      await presenceRef.set({
-        'online': true,
-        'lastSeen': ServerValue.timestamp,
-      });
+      // Configure Realtime presence for this device (best-effort/non-fatal)
+      try {
+        final presenceRef = _database.ref('presence/${user.uid}');
+        await presenceRef.onDisconnect().set({
+          'online': false,
+          'lastSeen': ServerValue.timestamp,
+        });
+        await presenceRef.set({
+          'online': true,
+          'lastSeen': ServerValue.timestamp,
+        });
+      } catch (presenceError) {
+        debugPrint('[ONLINE] Presence configuration deferred/non-fatal: $presenceError');
+      }
 
       return user.uid;
     } catch (e) {
@@ -105,7 +118,11 @@ class FirebaseOnlineBackend implements OnlineBackend {
     // Clean up any stale notification entry for self
     await matchNotificationRef.remove();
 
+    if (_matchCompleter != null && !_matchCompleter!.isCompleted) {
+      _matchCompleter!.complete(null);
+    }
     final matchCompleter = Completer<OnlineGameState?>();
+    _matchCompleter = matchCompleter;
 
     // Listen for match notification if we are placed in waiting state
     _matchNotificationSub = matchNotificationRef.onValue.listen((event) async {
@@ -128,7 +145,9 @@ class FirebaseOnlineBackend implements OnlineBackend {
               try {
                 await matchNotificationRef.remove();
               } catch (_) {}
-              matchCompleter.complete(state);
+              if (!matchCompleter.isCompleted) {
+                matchCompleter.complete(state);
+              }
             }
           }
         } catch (e) {
@@ -197,11 +216,17 @@ class FirebaseOnlineBackend implements OnlineBackend {
             throw const OnlineException('Matchmaking timed out. No opponent found.');
           },
         );
-        _activeGameId = result?.gameId;
+        if (result == null) {
+          return null;
+        }
+        _activeGameId = result.gameId;
         return result;
       } finally {
         await _matchNotificationSub?.cancel();
         _matchNotificationSub = null;
+        if (_matchCompleter == matchCompleter) {
+          _matchCompleter = null;
+        }
       }
     } else if (matchedWaitingUid != null) {
       // We are the second player who completed the pair with matchedWaitingUid
@@ -247,6 +272,10 @@ class FirebaseOnlineBackend implements OnlineBackend {
 
   @override
   Future<void> cancelMatchmaking() async {
+    if (_matchCompleter != null && !_matchCompleter!.isCompleted) {
+      _matchCompleter!.complete(null);
+    }
+    _matchCompleter = null;
     final uid = currentUserId;
     if (uid != null) {
       final queueRef = _database.ref('matchmaking_queue/waiting');
@@ -362,8 +391,8 @@ class FirebaseOnlineBackend implements OnlineBackend {
         }
 
         if (hostUid == uid) {
-          // Re-joining own room
-          return Transaction.success(data);
+          // Cannot join own room as guest
+          return Transaction.abort();
         }
 
         data['guestUid'] = uid;
@@ -378,6 +407,9 @@ class FirebaseOnlineBackend implements OnlineBackend {
           throw const OnlineException('Room not found.');
         }
         final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
+        if (data['hostUid'] == uid) {
+          throw const OnlineException('You cannot join your own room. Share this code with a friend on another device.');
+        }
         if (data['guestUid'] != null && data['guestUid'] != uid) {
           throw const OnlineException('Room is full.');
         }
@@ -448,12 +480,17 @@ class FirebaseOnlineBackend implements OnlineBackend {
     try {
       final gameRef = _database.ref('games/$gameId');
 
+      // Pre-fetch initial data so mutableData can be seeded on uncached transaction callbacks
+      final initialSnapshot = await gameRef.get();
+      final initialData = initialSnapshot.value;
+
       final transactionResult = await gameRef.runTransaction((mutableData) {
-        if (mutableData == null) {
+        final raw = mutableData ?? initialData;
+        if (raw is! Map) {
           return Transaction.abort();
         }
 
-        final data = Map<dynamic, dynamic>.from(mutableData as Map);
+        final data = Map<dynamic, dynamic>.from(raw);
         final status = data['status']?.toString();
         if (status != 'active') {
           return Transaction.abort();
@@ -464,8 +501,11 @@ class FirebaseOnlineBackend implements OnlineBackend {
         final currentTurn = data['currentTurn']?.toString() ?? 'X';
 
         String? role;
-        if (uid == playerX) role = 'X';
-        if (uid == playerO) role = 'O';
+        if (uid == playerX) {
+          role = 'X';
+        } else if (uid == playerO) {
+          role = 'O';
+        }
 
         if (role == null || role != currentTurn) {
           return Transaction.abort();
@@ -508,7 +548,7 @@ class FirebaseOnlineBackend implements OnlineBackend {
           data['status'] = 'finished';
         } else if (!boardList.contains(null)) {
           data['winner'] = 'Draw';
-          data['winningCells'] = null;
+          data.remove('winningCells');
           data['status'] = 'finished';
         } else {
           data['currentTurn'] = (role == 'X') ? 'O' : 'X';
@@ -540,36 +580,56 @@ class FirebaseOnlineBackend implements OnlineBackend {
     if (uid == null) return;
     try {
       final gameRef = _database.ref('games/$gameId');
+      final gameSnapshot = await gameRef.get();
+      if (!gameSnapshot.exists || gameSnapshot.value is! Map) return;
+      final gameData = Map<dynamic, dynamic>.from(gameSnapshot.value as Map);
 
-      await gameRef.runTransaction((mutableData) {
-        if (mutableData == null) return Transaction.abort();
-        final data = Map<dynamic, dynamic>.from(mutableData as Map);
-        final playerX = data['playerX']?.toString();
-        final playerO = data['playerO']?.toString();
+      final playerX = gameData['playerX']?.toString();
+      final playerO = gameData['playerO']?.toString();
+      final status = gameData['status']?.toString();
+      if (status != 'finished' || (uid != playerX && uid != playerO)) {
+        return;
+      }
 
-        Map<dynamic, dynamic> rematch = {};
-        if (data['rematch'] is Map) {
-          rematch = Map<dynamic, dynamic>.from(data['rematch'] as Map);
-        }
+      Map<dynamic, dynamic> rematch = {};
+      if (gameData['rematch'] is Map) {
+        rematch = Map<dynamic, dynamic>.from(gameData['rematch'] as Map);
+      }
 
-        if (uid == playerX) rematch['requestX'] = true;
-        if (uid == playerO) rematch['requestO'] = true;
+      final isX = (uid == playerX);
+      final otherRequested =
+          isX ? (rematch['requestO'] == true) : (rematch['requestX'] == true);
 
-        if (rematch['requestX'] == true && rematch['requestO'] == true) {
-          // Both agreed -> reset board to empty non-sparse map
-          data['board'] = <String, String>{};
+      if (otherRequested) {
+        // Both agreed -> atomically reset the round to active
+        final initialData = gameData;
+        await gameRef.runTransaction((mutableData) {
+          final raw = mutableData ?? initialData;
+          if (raw is! Map) return Transaction.abort();
+          final data = Map<dynamic, dynamic>.from(raw);
+          if (data['status'] != 'finished') {
+            return Transaction.abort();
+          }
+
+          data.remove('winner');
+          data.remove('winningCells');
+          data.remove('board');
           data['currentTurn'] = 'X';
           data['status'] = 'active';
-          data['winner'] = null;
-          data['winningCells'] = null;
           data['moveCount'] = 0;
           data['rematch'] = {'requestX': false, 'requestO': false};
+          data['updatedAt'] = ServerValue.timestamp;
+          return Transaction.success(data);
+        });
+      } else {
+        // First player requesting rematch -> update /games/$gameId/rematch directly
+        final rematchRef = _database.ref('games/$gameId/rematch');
+        if (isX) {
+          await rematchRef.update({'requestX': true});
         } else {
-          data['rematch'] = rematch;
+          await rematchRef.update({'requestO': true});
         }
-        data['updatedAt'] = ServerValue.timestamp;
-        return Transaction.success(data);
-      });
+      }
     } on OnlineException {
       rethrow;
     } catch (e) {
@@ -581,7 +641,7 @@ class FirebaseOnlineBackend implements OnlineBackend {
   Future<void> resetRound(String gameId) async {
     try {
       await _database.ref('games/$gameId').update({
-        'board': <String, String>{},
+        'board': null,
         'currentTurn': 'X',
         'status': 'active',
         'winner': null,

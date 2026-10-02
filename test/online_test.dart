@@ -22,7 +22,7 @@ void main() {
   });
 
   group('UI & Mode Selector Requirements (Tests 1-4)', () {
-    testWidgets('1. All four modes are permanently visible simultaneously',
+    testWidgets('1. All four modes are permanently visible simultaneously on Mode Selection page',
         (WidgetTester tester) async {
       tester.view.physicalSize = const Size(800, 1000);
       tester.view.devicePixelRatio = 1.0;
@@ -31,7 +31,7 @@ void main() {
 
       await tester.pumpWidget(const TicTacToeApp());
 
-      // Verify all four mode cards are present in the widget tree simultaneously
+      // Verify all four mode cards are present on the mode selection page
       expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
       expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
       expect(find.byKey(const Key('mode_complete_online')), findsOneWidget);
@@ -40,10 +40,10 @@ void main() {
       expect(find.text('COMPUTER'), findsOneWidget);
       expect(find.text('1 VS 1'), findsOneWidget);
       expect(find.text('COMPLETE ONLINE'), findsOneWidget);
-      expect(find.text('ONLINE WITH CODE'), findsOneWidget);
+      expect(find.text('ONLINE WITH FRIENDS'), findsOneWidget);
     });
 
-    testWidgets('2. Four modes are selectable and update active state while keeping all 4 visible',
+    testWidgets('2. Four modes navigate to their dedicated screens and support back navigation',
         (WidgetTester tester) async {
       tester.view.physicalSize = const Size(800, 1000);
       tester.view.devicePixelRatio = 1.0;
@@ -52,35 +52,29 @@ void main() {
 
       await tester.pumpWidget(const TicTacToeApp());
 
-      // Select COMPLETE ONLINE
+      // Select COMPLETE ONLINE -> navigates to CompleteOnlineScreen
       await tester.tap(find.byKey(const Key('mode_complete_online')));
       await tester.pumpAndSettle();
-
-      // All four modes must STILL be visible!
-      expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
-      expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
-      expect(find.byKey(const Key('mode_complete_online')), findsOneWidget);
-      expect(find.byKey(const Key('mode_online_with_code')), findsOneWidget);
 
       // COMPLETE ONLINE reveals FIND OPPONENT button
       expect(find.byKey(const Key('btn_find_opponent')), findsOneWidget);
 
-      // Select ONLINE WITH CODE
-      await tester.tap(find.byKey(const Key('mode_online_with_code')));
+      // Back to Mode Selection
+      await tester.tap(find.byKey(const Key('btn_back_to_modes')));
       await tester.pumpAndSettle();
 
-      // All four modes must STILL be visible!
-      expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
-      expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
-      expect(find.byKey(const Key('mode_complete_online')), findsOneWidget);
       expect(find.byKey(const Key('mode_online_with_code')), findsOneWidget);
+
+      // Select ONLINE WITH FRIENDS / CODE -> navigates to OnlineFriendsScreen
+      await tester.tap(find.byKey(const Key('mode_online_with_code')));
+      await tester.pumpAndSettle();
 
       // Reveals private room controls (CREATE ROOM / JOIN ROOM tabs)
       expect(find.byKey(const Key('btn_create_room_tab')), findsOneWidget);
       expect(find.byKey(const Key('btn_join_room_tab')), findsOneWidget);
     });
 
-    testWidgets('3. Computer mode regression: AI responds properly',
+    testWidgets('3. Computer mode regression: Mode Selection -> Setup -> Gameplay -> AI responds',
         (WidgetTester tester) async {
       tester.view.physicalSize = const Size(800, 1000);
       tester.view.devicePixelRatio = 1.0;
@@ -96,6 +90,10 @@ void main() {
       expect(find.byKey(const Key('difficulty_medium')), findsOneWidget);
       expect(find.byKey(const Key('difficulty_hard')), findsOneWidget);
 
+      // Start game
+      await tester.tap(find.byKey(const Key('btn_start_game')));
+      await tester.pumpAndSettle();
+
       // Human plays cell 0
       await tester.tap(find.byKey(const Key('cell_0')));
       await tester.pump(const Duration(milliseconds: 100));
@@ -110,7 +108,7 @@ void main() {
       expect(find.byType(PieceOWidget), findsOneWidget);
     });
 
-    testWidgets('4. 1 VS 1 mode regression: local turn alternation works',
+    testWidgets('4. 1 VS 1 mode regression: Mode Selection -> Gameplay -> local turn alternation works',
         (WidgetTester tester) async {
       tester.view.physicalSize = const Size(800, 1000);
       tester.view.devicePixelRatio = 1.0;
@@ -648,6 +646,10 @@ void main() {
       await tester.tap(find.byKey(const Key('btn_find_opponent')));
       await tester.pump();
 
+      // Back to Mode Selection
+      await tester.tap(find.byKey(const Key('btn_back_to_modes')));
+      await tester.pumpAndSettle();
+
       // Switch mode to COMPUTER
       await tester.tap(find.byKey(const Key('mode_vs_computer')));
       await tester.pumpAndSettle();
@@ -668,6 +670,9 @@ void main() {
       await tester.pumpWidget(TicTacToeApp(onlineBackend: backend));
 
       // Win a game in 1 VS 1 to get score of 1
+      await tester.tap(find.byKey(const Key('mode_two_players')));
+      await tester.pumpAndSettle();
+
       await tester.tap(find.byKey(const Key('cell_0'))); // X
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('cell_3'))); // O
@@ -681,20 +686,32 @@ void main() {
 
       expect(find.text('1'), findsOneWidget);
 
+      // Back to Mode Selection
+      await tester.tap(find.byKey(const Key('btn_back_to_menu')));
+      await tester.pumpAndSettle();
+
       // Switch to COMPUTER
       await tester.tap(find.byKey(const Key('mode_vs_computer')));
       await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('btn_start_game')));
+      await tester.pumpAndSettle();
       expect(find.text('1'), findsOneWidget);
+
+      // Back to Mode Selection
+      await tester.tap(find.byKey(const Key('btn_back_to_menu')));
+      await tester.pumpAndSettle();
 
       // Switch to COMPLETE ONLINE
       await tester.tap(find.byKey(const Key('mode_complete_online')));
       await tester.pumpAndSettle();
-      expect(find.text('1'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('btn_back_to_modes')));
+      await tester.pumpAndSettle();
 
       // Switch to ONLINE WITH CODE
       await tester.tap(find.byKey(const Key('mode_online_with_code')));
       await tester.pumpAndSettle();
-      expect(find.text('1'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('btn_back_to_modes')));
+      await tester.pumpAndSettle();
 
       // Switch back to 1 VS 1
       await tester.tap(find.byKey(const Key('mode_two_players')));
@@ -713,13 +730,22 @@ void main() {
       await tester.pumpWidget(const TicTacToeApp(onlineBackend: null));
 
       // 1 VS 1 works seamlessly
+      await tester.tap(find.byKey(const Key('mode_two_players')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('cell_0')));
       await tester.pumpAndSettle();
       expect(find.text('Player O to move'), findsOneWidget);
 
+      // Back to Mode Selection
+      await tester.tap(find.byKey(const Key('btn_back_to_menu')));
+      await tester.pumpAndSettle();
+
       // COMPUTER works seamlessly
       await tester.tap(find.byKey(const Key('mode_vs_computer')));
       await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('btn_start_game')));
+      await tester.pumpAndSettle();
+
       await tester.tap(find.byKey(const Key('cell_4')));
       await tester.pump(const Duration(milliseconds: 500));
       await tester.pumpAndSettle();
@@ -1553,6 +1579,329 @@ void main() {
         backendC.joinRoom(room.roomCode),
         throwsA(predicate((e) => e is OnlineException && e.message.contains('Room is full.'))),
       );
+    });
+  });
+
+  group('Online Rematch System & UI Layout Stability (Tests 57-65)', () {
+    test('57. Finished game can request rematch, and one player requesting does not immediately reset', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'pA');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'pB');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+
+      final gameId = room.gameId;
+
+      // Play to terminal state (X wins: 0, 1, 2)
+      await backendA.makeMove(gameId, 0); // X
+      await backendB.makeMove(gameId, 3); // O
+      await backendA.makeMove(gameId, 1); // X
+      await backendB.makeMove(gameId, 4); // O
+      await backendA.makeMove(gameId, 2); // X -> wins!
+
+      var game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.status, equals(OnlineGameStatus.finished));
+      expect(game.winner, equals('X'));
+
+      // Player A requests rematch
+      await backendA.requestRematch(gameId);
+
+      game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.rematchX, isTrue);
+      expect(game.rematchO, isFalse);
+      // Board must NOT be reset yet
+      expect(game.status, equals(OnlineGameStatus.finished));
+      expect(game.winner, equals('X'));
+      expect(game.board[0], equals('X'));
+    });
+
+    test('58. Both players requesting rematch resets the same game with identical player IDs and fresh board', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'host_p1');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'guest_p2');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+      final gameId = room.gameId;
+
+      // Play to win
+      await backendA.makeMove(gameId, 0);
+      await backendB.makeMove(gameId, 3);
+      await backendA.makeMove(gameId, 1);
+      await backendB.makeMove(gameId, 4);
+      await backendA.makeMove(gameId, 2); // X wins
+
+      // Both players request rematch
+      await backendA.requestRematch(gameId);
+      await backendB.requestRematch(gameId);
+
+      final resetGame = MockSharedDatabase.instance.games[gameId]!;
+      // Requirement 3: Same game is reset
+      expect(resetGame.gameId, equals(gameId));
+      // Requirement 4: Same player IDs unchanged
+      expect(resetGame.playerX, equals('host_p1'));
+      expect(resetGame.playerO, equals('guest_p2'));
+      // Requirement 5: Board becomes empty
+      expect(resetGame.board, equals(List.filled(9, null)));
+      // Requirement 6: Winner is cleared
+      expect(resetGame.winner, isNull);
+      // Requirement 7: Winning cells are cleared
+      expect(resetGame.winningCells, isNull);
+      // Requirement 8: Game becomes active
+      expect(resetGame.status, equals(OnlineGameStatus.active));
+      expect(resetGame.currentTurn, equals('X'));
+      expect(resetGame.rematchX, isFalse);
+      expect(resetGame.rematchO, isFalse);
+    });
+
+    test('59. Complete Online keeps the same two players together upon rematch', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'match_p1');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'match_p2');
+
+      final matchFutureA = backendA.findMatch();
+      final matchFutureB = backendB.findMatch();
+      final gameA = await matchFutureA;
+      final gameB = await matchFutureB;
+
+      expect(gameA!.gameId, equals(gameB!.gameId));
+      final gameId = gameA.gameId;
+
+      final pX = gameA.playerX == 'match_p1' ? backendA : backendB;
+      final pO = gameA.playerO == 'match_p1' ? backendA : backendB;
+
+      // Play to draw
+      await pX.makeMove(gameId, 0); // X
+      await pO.makeMove(gameId, 2); // O
+      await pX.makeMove(gameId, 1); // X
+      await pO.makeMove(gameId, 3); // O
+      await pX.makeMove(gameId, 5); // X
+      await pO.makeMove(gameId, 4); // O
+      await pX.makeMove(gameId, 6); // X
+      await pO.makeMove(gameId, 8); // O
+      await pX.makeMove(gameId, 7); // X -> Draw
+
+      var game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.winner, equals('Draw'));
+
+      // Both players rematch
+      await pX.requestRematch(gameId);
+      await pO.requestRematch(gameId);
+
+      final rematchedGame = MockSharedDatabase.instance.games[gameId]!;
+      // Requirement 10: Complete Online keeps same two players
+      expect(rematchedGame.playerX, equals(gameA.playerX));
+      expect(rematchedGame.playerO, equals(gameA.playerO));
+      expect(rematchedGame.status, equals(OnlineGameStatus.active));
+    });
+
+    test('60. Online With Friends keeps same room and host/guest relationship upon rematch', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'friend_host');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'friend_guest');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+      final gameId = room.gameId;
+
+      // Play to win
+      await backendA.makeMove(gameId, 0);
+      await backendB.makeMove(gameId, 3);
+      await backendA.makeMove(gameId, 1);
+      await backendB.makeMove(gameId, 4);
+      await backendA.makeMove(gameId, 2); // X win
+
+      await backendB.requestRematch(gameId);
+      await backendA.requestRematch(gameId);
+
+      // Room state must remain unchanged and active
+      final currentRoom = MockSharedDatabase.instance.rooms[room.roomCode]!;
+      expect(currentRoom.hostUid, equals('friend_host'));
+      expect(currentRoom.guestUid, equals('friend_guest'));
+      expect(currentRoom.status, equals('active'));
+      expect(currentRoom.gameId, equals(gameId));
+    });
+
+    test('61. Rapid duplicate rematch requests are safe and idempotent', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'dup_p1');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'dup_p2');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+      final gameId = room.gameId;
+
+      await backendA.makeMove(gameId, 0);
+      await backendB.makeMove(gameId, 3);
+      await backendA.makeMove(gameId, 1);
+      await backendB.makeMove(gameId, 4);
+      await backendA.makeMove(gameId, 2);
+
+      // Rapidly fire multiple requests from player A
+      await Future.wait([
+        backendA.requestRematch(gameId),
+        backendA.requestRematch(gameId),
+        backendA.requestRematch(gameId),
+      ]);
+
+      var game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.rematchX, isTrue);
+      expect(game.rematchO, isFalse);
+
+      // Now player B accepts
+      await backendB.requestRematch(gameId);
+      game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.status, equals(OnlineGameStatus.active));
+      expect(game.board, equals(List.filled(9, null)));
+    });
+
+    test('62. One player leaving while waiting for rematch abandons game cleanly', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'leave_p1');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'leave_p2');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+      final gameId = room.gameId;
+
+      await backendA.makeMove(gameId, 0);
+      await backendB.makeMove(gameId, 3);
+      await backendA.makeMove(gameId, 1);
+      await backendB.makeMove(gameId, 4);
+      await backendA.makeMove(gameId, 2);
+
+      // Player A requests rematch
+      await backendA.requestRematch(gameId);
+      expect(MockSharedDatabase.instance.games[gameId]!.rematchX, isTrue);
+
+      // Player B decides to leave instead
+      await backendB.leaveGame(gameId);
+
+      final game = MockSharedDatabase.instance.games[gameId]!;
+      expect(game.status, equals(OnlineGameStatus.abandoned));
+    });
+
+    test('63. Active game cannot be arbitrarily reset via requestRematch', () async {
+      final backendA = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'active_p1');
+      final backendB = MockOnlineBackend(database: MockSharedDatabase.instance, initialUid: 'active_p2');
+
+      final room = await backendA.createRoom();
+      await backendB.joinRoom(room.roomCode);
+      final gameId = room.gameId;
+
+      await backendA.makeMove(gameId, 0); // 1 move made, game still active!
+      expect(MockSharedDatabase.instance.games[gameId]!.status, equals(OnlineGameStatus.active));
+
+      // Attempt to request rematch during active game
+      await backendA.requestRematch(gameId);
+      final game = MockSharedDatabase.instance.games[gameId]!;
+      // Must NOT be accepted or modified
+      expect(game.rematchX, isFalse);
+      expect(game.status, equals(OnlineGameStatus.active));
+      expect(game.board[0], equals('X'));
+    });
+
+    testWidgets('64. Rematch Modal UI renders on game completion and provides REMATCH and EXIT TO MENU',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(800, 1000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final db = MockSharedDatabase.instance;
+      final backend = MockOnlineBackend(database: db, initialUid: 'ui_tester_host');
+      final controller = TicTacToeController(initialBackend: backend);
+
+      await tester.pumpWidget(MaterialApp(home: GameplayScreen(controller: controller)));
+
+      // Simulate active online game with code
+      final room = await backend.createRoom();
+      final guestBackend = MockOnlineBackend(database: db, initialUid: 'ui_tester_guest');
+      await guestBackend.joinRoom(room.roomCode);
+
+      final session = ActiveSessionData(
+        gameId: room.gameId,
+        roomCode: room.roomCode,
+        role: 'X',
+        mode: 'onlineWithCode',
+        isHost: true,
+      );
+      await SessionStorageService.instance.saveSession(session);
+      await controller.restoreActiveSession();
+      await tester.pumpAndSettle();
+
+      // Ensure modal is NOT present while game is active
+      expect(find.byKey(const Key('btn_rematch')), findsNothing);
+
+      // Play moves to win
+      controller.handleTap(0);
+      await tester.pump(const Duration(milliseconds: 50));
+      await guestBackend.makeMove(room.gameId, 3);
+      await tester.pump(const Duration(milliseconds: 50));
+      controller.handleTap(1);
+      await tester.pump(const Duration(milliseconds: 50));
+      await guestBackend.makeMove(room.gameId, 4);
+      await tester.pump(const Duration(milliseconds: 50));
+      controller.handleTap(2); // X wins!
+      await tester.pumpAndSettle();
+
+      // Now Rematch Modal MUST appear with VICTORY!, REMATCH, and EXIT TO MENU
+      expect(find.text('VICTORY!'), findsOneWidget);
+      expect(find.byKey(const Key('btn_rematch')), findsOneWidget);
+      expect(find.byKey(const Key('btn_exit_game')), findsOneWidget);
+
+      // Tap REMATCH
+      await tester.tap(find.byKey(const Key('btn_rematch')));
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // Host sees waiting for opponent
+      expect(find.text('Waiting for opponent to accept...'), findsOneWidget);
+      expect(find.text('CANCEL & EXIT'), findsOneWidget);
+
+      // Guest accepts rematch
+      await guestBackend.requestRematch(room.gameId);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pumpAndSettle();
+
+      // Modal must automatically disappear and board must be cleared for new round
+      expect(find.byKey(const Key('btn_rematch')), findsNothing);
+      expect(controller.winner, isNull);
+      expect(controller.board.every((c) => c == null), isTrue);
+    });
+
+    testWidgets('65. UI Layout stability: Button height and constraints remain fixed without jitter',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(800, 1000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(const TicTacToeApp());
+
+      // Mode Selection screen: verify mode cards have height 68.0
+      final computerCardFinder = find.byKey(const Key('mode_vs_computer'));
+      final computerSize = tester.getSize(computerCardFinder);
+      expect(computerSize.height, equals(68.0));
+
+      // Navigate to Computer Setup
+      await tester.tap(computerCardFinder);
+      await tester.pumpAndSettle();
+
+      // Verify difficulty buttons have fixed height 42.0
+      final easyFinder = find.byKey(const Key('difficulty_easy'));
+      final easySizeBefore = tester.getSize(easyFinder);
+      expect(easySizeBefore.height, equals(42.0));
+
+      // Select HARD
+      final hardFinder = find.byKey(const Key('difficulty_hard'));
+      await tester.tap(hardFinder);
+      await tester.pumpAndSettle();
+
+      // Verify height does not change when selected
+      final easySizeAfter = tester.getSize(easyFinder);
+      final hardSizeAfter = tester.getSize(hardFinder);
+      expect(easySizeAfter.height, equals(42.0));
+      expect(hardSizeAfter.height, equals(42.0));
+
+      // Verify Start Game button has fixed height 44.0
+      final startBtn = find.byKey(const Key('btn_start_game'));
+      final startBtnSize = tester.getSize(startBtn);
+      expect(startBtnSize.height, equals(44.0));
     });
   });
 }

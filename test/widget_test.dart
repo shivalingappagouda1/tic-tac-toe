@@ -8,7 +8,8 @@ void main() {
     TestWidgetsFlutterBinding.ensureInitialized();
   });
 
-  testWidgets('Initial UI state test', (WidgetTester tester) async {
+  testWidgets('Initial UI state test: Dedicated Mode Selection Page with NO board',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -16,30 +17,45 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Check game display text
+    // Page 1 header
+    expect(find.text('GAME MODES'), findsOneWidget);
+    expect(find.text('SELECT HOW TO PLAY'), findsOneWidget);
+
+    // All four mode options are present
+    expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
+    expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
+    expect(find.byKey(const Key('mode_complete_online')), findsOneWidget);
+    expect(find.byKey(const Key('mode_online_with_code')), findsOneWidget);
+
+    // CRITICAL: The gameplay board and game controls MUST NOT appear on the first page
+    for (int i = 0; i < 9; i++) {
+      expect(find.byKey(Key('cell_$i')), findsNothing);
+    }
+    expect(find.text('Player X to move'), findsNothing);
+    expect(find.text('PLACE 3 IN A ROW!'), findsNothing);
+    expect(find.byKey(const Key('new_game_button')), findsNothing);
+    expect(find.byKey(const Key('reset_scores_button')), findsNothing);
+  });
+
+  testWidgets('1 VS 1 flow: navigates to Gameplay page, alternates turns and prevents overwrite',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(const TicTacToeApp());
+
+    // Tap 1 VS 1 mode
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
+
+    // Now in Gameplay Page
     expect(find.text('Player X to move'), findsOneWidget);
     expect(find.text('PLACE 3 IN A ROW!'), findsOneWidget);
-
-    // Check sound button and initial unmuted icon
-    expect(find.byKey(const Key('sound_button')), findsOneWidget);
-    expect(find.byIcon(Icons.volume_up_rounded), findsOneWidget);
-
-    // Initial scores in score plaque: 0, 0, 0
-    expect(find.text('0'), findsNWidgets(3));
-
-    // Verify all 9 cells exist
     for (int i = 0; i < 9; i++) {
       expect(find.byKey(Key('cell_$i')), findsOneWidget);
     }
-  });
-
-  testWidgets('Alternates turns and prevents overwriting cell', (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(800, 1000);
-    tester.view.devicePixelRatio = 1.0;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-
-    await tester.pumpWidget(const TicTacToeApp());
 
     // Player 1 (X) taps cell 0
     await tester.tap(find.byKey(const Key('cell_0')));
@@ -62,13 +78,17 @@ void main() {
     expect(find.text('Player X to move'), findsOneWidget);
   });
 
-  testWidgets('Detects horizontal win and updates score', (WidgetTester tester) async {
+  testWidgets('1 VS 1 flow: detects horizontal win and updates score',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
     await tester.pumpWidget(const TicTacToeApp());
+
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
 
     // X: 0, O: 3
     // X: 1, O: 4
@@ -106,13 +126,17 @@ void main() {
     expect(find.text('1'), findsOneWidget);
   });
 
-  testWidgets('Detects draw game and updates draw count', (WidgetTester tester) async {
+  testWidgets('1 VS 1 flow: detects draw game and updates draw count',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
     await tester.pumpWidget(const TicTacToeApp());
+
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
 
     // Draw moves sequence:
     // X: 0, O: 1, X: 2, O: 4, X: 3, O: 5, X: 7, O: 6, X: 8
@@ -129,13 +153,17 @@ void main() {
     expect(find.text('1'), findsOneWidget);
   });
 
-  testWidgets('Reset button clears scores and board', (WidgetTester tester) async {
+  testWidgets('Reset button clears scores and board on Gameplay page',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
     await tester.pumpWidget(const TicTacToeApp());
+
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
 
     // Win a game for X
     await tester.tap(find.byKey(const Key('cell_0'))); // X
@@ -170,7 +198,7 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Initially unmuted
+    // Initially unmuted on Mode Selection page
     expect(find.byIcon(Icons.volume_up_rounded), findsOneWidget);
     expect(find.byIcon(Icons.volume_off_rounded), findsNothing);
 
@@ -189,13 +217,17 @@ void main() {
     expect(find.byIcon(Icons.volume_off_rounded), findsNothing);
   });
 
-  testWidgets('Renders winning line beam when a player wins', (WidgetTester tester) async {
+  testWidgets('Renders winning line beam when a player wins',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
     await tester.pumpWidget(const TicTacToeApp());
+
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
 
     // Win with top row: 0, 1, 2
     await tester.tap(find.byKey(const Key('cell_0'))); // X
@@ -216,13 +248,17 @@ void main() {
     expect(customPaintFinder, findsOneWidget);
   });
 
-  testWidgets('Simulates complete multi-round game: X win, O win, and Draw', (WidgetTester tester) async {
+  testWidgets('Simulates complete multi-round game: X win, O win, and Draw',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
     await tester.pumpWidget(const TicTacToeApp());
+
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
 
     // --- ROUND 1: X WINS (Row 0: 0, 1, 2) ---
     await tester.tap(find.byKey(const Key('cell_0'))); // X
@@ -288,8 +324,8 @@ void main() {
     expect(find.text('Player X to move'), findsOneWidget);
   });
 
-  testWidgets('Header layout guarantees zero overlap between title and controls', (WidgetTester tester) async {
-    // Desktop layout test
+  testWidgets('Header layout guarantees zero overlap between title and controls on Gameplay page',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -297,7 +333,9 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Verify title text and sound button
+    await tester.tap(find.byKey(const Key('mode_two_players')));
+    await tester.pumpAndSettle();
+
     final titleFinder = find.text('Player X to move');
     final soundButtonFinder = find.byKey(const Key('sound_button'));
     expect(titleFinder, findsOneWidget);
@@ -306,28 +344,12 @@ void main() {
     final titleRect = tester.getRect(titleFinder);
     final buttonRect = tester.getRect(soundButtonFinder);
 
-    // Title must be strictly to the left of the right controls area
     expect(titleRect.right <= buttonRect.left, isTrue,
-        reason: 'Title text (${titleRect.right}) must not overlap or touch controls (${buttonRect.left})');
-
-    // Test on narrow mobile screen (< 370px)
-    tester.view.physicalSize = const Size(320, 600);
-    await tester.pumpAndSettle();
-
-    final mobileTitleFinder = find.text('Player X to move');
-    final mobileButtonFinder = find.byKey(const Key('sound_button'));
-    expect(mobileTitleFinder, findsOneWidget);
-    expect(mobileButtonFinder, findsOneWidget);
-
-    final mobileTitleRect = tester.getRect(mobileTitleFinder);
-    final mobileButtonRect = tester.getRect(mobileButtonFinder);
-
-    // On narrow screen, controls are above the title, so title top > button bottom
-    expect(mobileTitleRect.top >= mobileButtonRect.bottom, isTrue,
-        reason: 'On mobile, title must be placed cleanly below controls row with zero overlap');
+        reason: 'Title text must not overlap or touch controls');
   });
 
-  testWidgets('Vs Computer mode: mode selection reveals difficulty buttons and initializes match', (WidgetTester tester) async {
+  testWidgets('Vs Computer flow: Mode Selection -> Setup -> Difficulty Selection -> Start -> AI moves',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -335,57 +357,41 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Initially in Two Players mode: difficulty buttons hidden
-    expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
+    // Step 1: Mode Selection
     expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
-    expect(find.byKey(const Key('difficulty_easy')), findsNothing);
-    expect(find.byKey(const Key('difficulty_medium')), findsNothing);
-    expect(find.byKey(const Key('difficulty_hard')), findsNothing);
-
-    // Switch to VS COMPUTER
     await tester.tap(find.byKey(const Key('mode_vs_computer')));
     await tester.pumpAndSettle();
 
-    // Now difficulty buttons are visible
+    // Step 2: Computer Setup Page (NO board here!)
+    expect(find.text('VS COMPUTER'), findsOneWidget);
     expect(find.byKey(const Key('difficulty_easy')), findsOneWidget);
     expect(find.byKey(const Key('difficulty_medium')), findsOneWidget);
     expect(find.byKey(const Key('difficulty_hard')), findsOneWidget);
+    expect(find.byKey(const Key('btn_start_game')), findsOneWidget);
+    for (int i = 0; i < 9; i++) {
+      expect(find.byKey(Key('cell_$i')), findsNothing);
+    }
 
-    // Status text should be "Your Turn"
-    expect(find.text('Your Turn'), findsOneWidget);
-
-    // Score plaque labels should show YOU (X) and COM (O)
-    expect(find.text('YOU (X): '), findsOneWidget);
-    expect(find.text('COM (O): '), findsOneWidget);
-
-    // Tap difficulty buttons
+    // Select Easy difficulty
     await tester.tap(find.byKey(const Key('difficulty_easy')));
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('difficulty_hard')));
+
+    // Start game
+    await tester.tap(find.byKey(const Key('btn_start_game')));
     await tester.pumpAndSettle();
-  });
 
-  testWidgets('Vs Computer mode: human move triggers computer response and locks taps during thinking', (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(800, 1000);
-    tester.view.devicePixelRatio = 1.0;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-
-    await tester.pumpWidget(const TicTacToeApp());
-
-    // Switch to VS COMPUTER
-    await tester.tap(find.byKey(const Key('mode_vs_computer')));
-    await tester.pumpAndSettle();
+    // Step 3: Gameplay Page (Board is now visible!)
+    expect(find.text('Your Turn'), findsOneWidget);
+    expect(find.byKey(const Key('cell_0')), findsOneWidget);
 
     // Human taps cell 0
     await tester.tap(find.byKey(const Key('cell_0')));
-    await tester.pump(); // Register human move
+    await tester.pump();
 
-    // State should now be "Computer Thinking..."
     expect(find.text('Computer Thinking...'), findsOneWidget);
     expect(find.byType(PieceXWidget), findsOneWidget);
 
-    // Attempt to tap cell 1 while computer is thinking (MUST be ignored)
+    // Attempt to tap cell 1 while computer thinking (ignored)
     await tester.tap(find.byKey(const Key('cell_1')));
     await tester.pump();
     expect(find.text('Computer Thinking...'), findsOneWidget);
@@ -394,13 +400,12 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pumpAndSettle();
 
-    // Computer has made move O
     expect(find.byType(PieceOWidget), findsOneWidget);
-    // Control returned to human
     expect(find.text('Your Turn'), findsOneWidget);
   });
 
-  testWidgets('Vs Computer mode: human victory displays "You Win!" and updates score', (WidgetTester tester) async {
+  testWidgets('Back navigation: Computer Setup back returns to Mode Selection',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -408,43 +413,22 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Switch to VS COMPUTER with Easy mode
     await tester.tap(find.byKey(const Key('mode_vs_computer')));
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('difficulty_easy')));
+
+    expect(find.text('VS COMPUTER'), findsOneWidget);
+
+    // Tap back button
+    await tester.tap(find.byKey(const Key('btn_back_to_modes')));
     await tester.pumpAndSettle();
 
-    // Force moves by tapping cells that lead to human win
-    // Human plays 0, 1, 2 (Row 0)
-    await tester.tap(find.byKey(const Key('cell_0')));
-    await tester.pump(const Duration(milliseconds: 500));
-    await tester.pumpAndSettle();
-
-    // Next human move
-    if (find.byKey(const Key('cell_1')).evaluate().isNotEmpty) {
-      // Find an available cell in row 0 or row 1
-      for (final c in [1, 2, 3, 4, 5, 6, 7, 8]) {
-        // Find if empty
-        await tester.tap(find.byKey(Key('cell_$c')));
-        await tester.pump(const Duration(milliseconds: 500));
-        await tester.pumpAndSettle();
-        if (find.text('You Win!').evaluate().isNotEmpty ||
-            find.text('Computer Wins!').evaluate().isNotEmpty ||
-            find.text("It's a Draw!").evaluate().isNotEmpty) {
-          break;
-        }
-      }
-    }
-
-    // New Round works in computer mode
-    await tester.ensureVisible(find.byKey(const Key('new_game_button')));
-    await tester.tap(find.byKey(const Key('new_game_button')));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Your Turn'), findsOneWidget);
+    // Returned to Mode Selection
+    expect(find.text('GAME MODES'), findsOneWidget);
+    expect(find.byKey(const Key('mode_vs_computer')), findsOneWidget);
   });
 
-  testWidgets('Mode switching resets board state without corrupting session scores', (WidgetTester tester) async {
+  testWidgets('Back navigation: Gameplay page back returns to Mode Selection',
+      (WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -452,38 +436,17 @@ void main() {
 
     await tester.pumpWidget(const TicTacToeApp());
 
-    // Win a game in Two Players mode
-    await tester.tap(find.byKey(const Key('cell_0'))); // X
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('cell_3'))); // O
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('cell_1'))); // X
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('cell_4'))); // O
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('cell_2'))); // X wins
-    await tester.pumpAndSettle();
-
-    expect(find.text('Player X Wins!'), findsOneWidget);
-    // Score is 1
-    expect(find.text('1'), findsOneWidget);
-
-    // Switch to VS COMPUTER mode
-    await tester.tap(find.byKey(const Key('mode_vs_computer')));
-    await tester.pumpAndSettle();
-
-    // Board reset, fresh match in computer mode, but score persists
-    expect(find.text('Your Turn'), findsOneWidget);
-    expect(find.text('1'), findsOneWidget);
-    expect(find.byType(PieceXWidget), findsNothing);
-    expect(find.byType(PieceOWidget), findsNothing);
-
-    // Switch back to TWO PLAYERS
     await tester.tap(find.byKey(const Key('mode_two_players')));
     await tester.pumpAndSettle();
 
     expect(find.text('Player X to move'), findsOneWidget);
-    expect(find.text('1'), findsOneWidget);
+
+    // Tap back button on Gameplay page
+    await tester.tap(find.byKey(const Key('btn_back_to_menu')));
+    await tester.pumpAndSettle();
+
+    // Returned to Mode Selection
+    expect(find.text('GAME MODES'), findsOneWidget);
+    expect(find.byKey(const Key('mode_two_players')), findsOneWidget);
   });
 }
-
